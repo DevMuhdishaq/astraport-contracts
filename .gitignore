@@ -1,0 +1,30 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# Soroban
+.soroban/
+*.wasm
+
+# Build artifacts
+/dist/
+*.o
+*.so
+
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
