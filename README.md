@@ -58,7 +58,7 @@ Emits and manages events on portfolio changes with AI analysis triggers.
 - Event-driven automation
 
 ### 3. **Staking Contract**
-Manages asset staking with alert thresholds and balance monitoring.
+Manages asset staking with alert thresholds, balance monitoring, and an accurate compounding **yield calculation engine**.
 
 **Key Functions:**
 - `initialize()` - Initialize the contract
@@ -67,10 +67,21 @@ Manages asset staking with alert thresholds and balance monitoring.
 - `get_balance(staker)` - Query staking balance
 - `set_alert_threshold(threshold)` - Configure alert thresholds
 
+**Yield Engine Functions:**
+- `open_yield_position(staker, asset, principal, apr, mode)` - Begin accruing yield
+- `accrue_yield(staker, asset)` - Checkpoint accrued yield to now
+- `current_yield(staker, asset)` - Read real-time yield without mutating state
+- `set_yield_rate(staker, asset, new_apr)` - Change APR with time-weighted accrual
+- `yield_history(staker, asset)` - Query complete yield history
+- `project_yield(principal, apr, mode, horizon_seconds)` - Estimate future earnings
+- `apr_to_apy(apr, mode)` / `apy_to_apr(apy, mode)` - Convert nominal ⇄ effective rates
+- `schedule_distribution(...)` / `process_distribution(staker, asset)` - Schedule/pay yield
+
 **Use Cases:**
-- Asset staking and yield generation
-- Balance monitoring
-- Threshold-based alerts
+- Asset staking with daily or continuous compounding
+- Accurate APY/APR reporting (within 0.01%)
+- Variable rate handling and time-weighted accrual
+- Real-time yield tracking, projections, and distribution scheduling
 
 ---
 
