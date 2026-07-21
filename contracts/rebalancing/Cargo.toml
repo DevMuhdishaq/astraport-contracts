@@ -8,7 +8,7 @@ license.workspace = true
 [lib]
 
 [dependencies]
-soroban-sdk = { workspace = true, features = ["contract", "std"] }
+soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["contract", "std"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }

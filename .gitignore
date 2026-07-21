@@ -1,8 +1,13 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
+
+# Cargo.lock is committed: these are deployable contract crates, and the lock
+# pins transitive deps to versions compatible with the pinned rustc (1.75).
+
+# Soroban test snapshots (regenerated on every `cargo test`)
+**/test_snapshots/
 
 # IDE
 .vscode/
