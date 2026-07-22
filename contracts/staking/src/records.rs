@@ -134,3 +134,28 @@ pub enum YieldDataKey {
     /// The [`DistributionSchedule`] list for a `(staker, asset)` pair.
     Schedule(Address, Symbol),
 }
+
+/// Default yield parameters applied when a position is first opened by a stake.
+///
+/// A single position, once opened, keeps its own APR and compounding mode across
+/// subsequent stakes/unstakes (which only adjust principal); these defaults seed
+/// brand-new positions and can be reconfigured before the first stake.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct StakingConfig {
+    /// APR seeded onto a newly opened yield position, fixed-point (see
+    /// [`crate::fixed_point::SCALE`]).
+    pub default_apr: i128,
+    /// Compounding mode seeded onto a newly opened yield position.
+    pub default_mode: CompoundingMode,
+}
+
+/// Storage keys for the staking layer that sits in front of the yield engine.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub enum StakeDataKey {
+    /// Staked balance (principal) for a `(staker, asset)` pair, base units.
+    Balance(Address, Symbol),
+    /// The default [`StakingConfig`] used when opening new positions.
+    Config,
+}

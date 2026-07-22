@@ -87,6 +87,32 @@ impl<'a> YieldEngine<'a> {
         Ok(updated)
     }
 
+    /// Adjust the principal of an existing position to `new_principal`,
+    /// preserving its APR, compounding mode, and realized `accrued_yield`.
+    ///
+    /// The position is checkpointed (accrued to now) *before* the principal
+    /// changes, so all yield earned on the old principal is realized and no yield
+    /// is lost across the boundary. This is what stake/unstake use to keep a
+    /// position's principal equal to the staked balance without resetting its
+    /// rate.
+    pub fn set_principal(
+        &self,
+        staker: &Address,
+        asset: &Symbol,
+        new_principal: i128,
+    ) -> Result<YieldRecord, MathError> {
+        let now = self.env.ledger().timestamp();
+        let record = self
+            .load_record(staker, asset)
+            .ok_or(MathError::NegativeInput)?;
+        // Realize everything earned on the old principal first.
+        let mut updated = self.accrue_to(&record, now)?;
+        // Then move principal going forward.
+        updated.principal = new_principal;
+        self.store_record(&updated);
+        Ok(updated)
+    }
+
     /// Change the APR for a position, checkpointing accrued yield at the old rate
     /// first so the transition is exact and time-weighted.
     pub fn set_rate(
