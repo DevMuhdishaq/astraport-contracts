@@ -262,3 +262,61 @@ fn zero_principal_accrues_nothing() {
     let rec = client.accrue_yield(&staker, &asset);
     assert_eq!(rec.accrued_yield, 0);
 }
+
+// --- yield claiming -------------------------------------------------------
+
+#[test]
+fn accrue_claim_and_reclaim_resets_unclaimed_yield() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    client.open_yield_position(
+        &staker,
+        &asset,
+        &SCALE,
+        &(SCALE / 10),
+        &CompoundingMode::Daily,
+    );
+
+    // Checkpoint earnings, then claim exactly the checkpointed amount.
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+    let accrued = client.accrue_yield(&staker, &asset).accrued_yield;
+    assert!(accrued > 0);
+
+    env.mock_all_auths();
+    assert_eq!(client.claim_yield(&staker, &asset), accrued);
+    assert_eq!(client.current_yield(&staker, &asset), 0);
+
+    // No time has elapsed, so a second claim cannot pay the same yield twice.
+    assert_eq!(client.claim_yield(&staker, &asset), 0);
+
+    let history = client.yield_history(&staker, &asset);
+    assert_eq!(history.len(), 3);
+    let claim = history.get(1).unwrap();
+    assert!(claim.is_claim);
+    assert_eq!(claim.period_seconds, 0);
+    assert_eq!(claim.yield_earned, 0);
+    assert_eq!(claim.cumulative_yield, 0);
+}
+
+#[test]
+#[should_panic]
+fn claim_yield_requires_staker_auth() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    client.open_yield_position(
+        &staker,
+        &asset,
+        &SCALE,
+        &(SCALE / 10),
+        &CompoundingMode::Daily,
+    );
+
+    // No mock authorization is supplied for `staker`.
+    client.claim_yield(&staker, &asset);
+}

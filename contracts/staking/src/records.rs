@@ -65,8 +65,8 @@ pub struct YieldRecord {
 
 /// A single immutable entry in a staker/asset yield history log.
 ///
-/// One entry is appended each time yield is checkpointed (accrued) or the rate
-/// changes, forming a complete, queryable audit trail.
+/// One entry is appended each time yield is checkpointed (accrued), the rate
+/// changes, or yield is claimed, forming a complete, queryable audit trail.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub struct YieldHistoryEntry {
@@ -78,8 +78,11 @@ pub struct YieldHistoryEntry {
     pub apr: i128,
     /// Yield earned during this period, base units.
     pub yield_earned: i128,
-    /// Cumulative yield after this entry, base units.
+    /// Cumulative unclaimed yield after this entry, base units.
     pub cumulative_yield: i128,
+    /// True when this is a zero-period marker recording a yield claim.
+    /// Claim markers have `yield_earned == 0` and `cumulative_yield == 0`.
+    pub is_claim: bool,
 }
 
 /// A projected future-earnings estimate for a position.
