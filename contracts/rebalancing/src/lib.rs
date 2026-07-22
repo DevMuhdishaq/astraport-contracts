@@ -1,5 +1,14 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Env, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Env, Map, Symbol, Vec};
+
+/// Errors returned by the rebalancing contract.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RebalancingError {
+    /// The target allocation weights do not sum to 10_000 basis points (100%).
+    InvalidAllocation = 1,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,10 +36,21 @@ pub struct ExecutionHistoryRecord {
     pub details: Symbol,
 }
 
+/// Target allocation for a portfolio.
+///
+/// Maps each asset symbol to its target weight in basis points (1/100th of a
+/// percent). All weights must sum to exactly 10_000 (= 100%).
+#[contracttype]
+#[derive(Clone)]
+pub struct TargetAllocation {
+    pub allocations: Map<Symbol, u32>,
+}
+
 #[contracttype]
 pub enum DataKey {
     Schedule(Symbol),
     History(Symbol),
+    Allocation(Symbol),
 }
 
 pub struct ScheduleValidator;
@@ -66,7 +86,7 @@ impl RebalancingContract {
     /// 
     /// # Returns
     /// Success symbol if initialization succeeds
-    pub fn initialize(env: Env) -> Symbol {
+    pub fn initialize(_env: Env) -> Symbol {
         symbol_short!("ok")
     }
 
@@ -78,7 +98,7 @@ impl RebalancingContract {
     /// 
     /// # Returns
     /// Success symbol if rebalancing succeeds
-    pub fn rebalance(env: Env, portfolio_id: Symbol) -> Symbol {
+    pub fn rebalance(_env: Env, _portfolio_id: Symbol) -> Symbol {
         symbol_short!("done")
     }
 
@@ -90,7 +110,7 @@ impl RebalancingContract {
     /// 
     /// # Returns
     /// Status symbol
-    pub fn get_status(env: Env, portfolio_id: Symbol) -> Symbol {
+    pub fn get_status(_env: Env, _portfolio_id: Symbol) -> Symbol {
         symbol_short!("ok")
     }
 
@@ -159,6 +179,47 @@ impl RebalancingContract {
         env.storage().persistent().get(&key)
     }
 
+    /// Set the target allocation for a portfolio.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `portfolio_id` - Identifier for the portfolio
+    /// * `allocation` - Target allocation with asset→basis-points weights
+    ///
+    /// # Returns
+    /// `Ok(ok)` if the allocation is valid (sums to 10_000 bps) and persisted.
+    /// `Err(RebalancingError::InvalidAllocation)` if weights don't sum to 10_000.
+    pub fn set_target_allocation(
+        env: Env,
+        portfolio_id: Symbol,
+        allocation: TargetAllocation,
+    ) -> Result<Symbol, RebalancingError> {
+        let mut total: u32 = 0;
+        for (_asset, weight) in allocation.allocations.iter() {
+            total += weight;
+        }
+        if total != 10_000 {
+            return Err(RebalancingError::InvalidAllocation);
+        }
+
+        let key = DataKey::Allocation(portfolio_id);
+        env.storage().persistent().set(&key, &allocation);
+        Ok(symbol_short!("ok"))
+    }
+
+    /// Get the target allocation for a portfolio.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `portfolio_id` - Identifier for the portfolio
+    ///
+    /// # Returns
+    /// `Some(TargetAllocation)` if one has been set, `None` otherwise.
+    pub fn get_target_allocation(env: Env, portfolio_id: Symbol) -> Option<TargetAllocation> {
+        let key = DataKey::Allocation(portfolio_id);
+        env.storage().persistent().get(&key)
+    }
+
     /// Get execution history for a portfolio
     pub fn get_execution_history(env: Env, portfolio_id: Symbol) -> Vec<ExecutionHistoryRecord> {
         let key = DataKey::History(portfolio_id);
@@ -166,7 +227,7 @@ impl RebalancingContract {
     }
 
     /// Check and execute scheduled rebalance
-    pub fn check_and_execute_scheduled_rebalance(env: Env, portfolio_id: Symbol) -> Symbol {
+    pub fn exec_scheduled_rebalance(env: Env, portfolio_id: Symbol) -> Symbol {
         let key = DataKey::Schedule(portfolio_id.clone());
         if !env.storage().persistent().has(&key) {
             return symbol_short!("err_none");
@@ -198,7 +259,7 @@ impl RebalancingContract {
         let record = ExecutionHistoryRecord {
             timestamp: now,
             outcome: outcome.clone(),
-            details: symbol_short!("sched_exec"),
+            details: symbol_short!("sched_ex"),
         };
         history.push_back(record);
         env.storage().persistent().set(&history_key, &history);
@@ -210,7 +271,15 @@ impl RebalancingContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{Env, symbol_short};
+    use soroban_sdk::{Env, symbol_short, map};
+    use soroban_sdk::testutils::Ledger;
+
+    /// Register the contract and run a test closure inside `as_contract`.
+    fn test_in_contract<T>(f: impl FnOnce(Env) -> T) -> T {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, RebalancingContract);
+        env.as_contract(&contract_id, || f(env.clone()))
+    }
 
     #[test]
     fn test_initialize() {
@@ -221,78 +290,195 @@ mod tests {
 
     #[test]
     fn test_set_and_get_schedule() {
-        let env = Env::default();
-        let portfolio = symbol_short!("port1");
-        
-        assert!(RebalancingContract::get_schedule(env.clone(), portfolio.clone()).is_none());
-        
-        let res = RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Hourly);
-        assert_eq!(res, symbol_short!("ok"));
-        
-        let schedule = RebalancingContract::get_schedule(env.clone(), portfolio.clone()).unwrap();
-        assert_eq!(schedule.portfolio_id, portfolio);
-        assert_eq!(schedule.interval, RebalanceInterval::Hourly);
-        assert_eq!(schedule.last_execution, 0);
-        assert_eq!(schedule.next_execution, 3600);
-        
-        let res_dup = RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Daily);
-        assert_eq!(res_dup, symbol_short!("err_exist"));
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            assert!(RebalancingContract::get_schedule(env.clone(), portfolio.clone()).is_none());
+
+            let res = RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Hourly);
+            assert_eq!(res, symbol_short!("ok"));
+
+            let schedule = RebalancingContract::get_schedule(env.clone(), portfolio.clone()).unwrap();
+            assert_eq!(schedule.portfolio_id, portfolio);
+            assert_eq!(schedule.interval, RebalanceInterval::Hourly);
+            assert_eq!(schedule.last_execution, 0);
+            assert_eq!(schedule.next_execution, 3600);
+
+            let res_dup = RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Daily);
+            assert_eq!(res_dup, symbol_short!("err_exist"));
+        });
     }
 
     #[test]
     fn test_update_and_cancel_schedule() {
-        let env = Env::default();
-        let portfolio = symbol_short!("port1");
-        
-        let res_up = RebalancingContract::update_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Daily);
-        assert_eq!(res_up, symbol_short!("err_none"));
-        
-        RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Hourly);
-        
-        let res_up2 = RebalancingContract::update_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Daily);
-        assert_eq!(res_up2, symbol_short!("ok"));
-        
-        let schedule = RebalancingContract::get_schedule(env.clone(), portfolio.clone()).unwrap();
-        assert_eq!(schedule.interval, RebalanceInterval::Daily);
-        
-        let res_cancel = RebalancingContract::cancel_schedule(env.clone(), portfolio.clone());
-        assert_eq!(res_cancel, symbol_short!("ok"));
-        
-        assert!(RebalancingContract::get_schedule(env.clone(), portfolio.clone()).is_none());
-        
-        let res_cancel2 = RebalancingContract::cancel_schedule(env.clone(), portfolio.clone());
-        assert_eq!(res_cancel2, symbol_short!("err_none"));
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            let res_up = RebalancingContract::update_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Daily);
+            assert_eq!(res_up, symbol_short!("err_none"));
+
+            RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Hourly);
+
+            let res_up2 = RebalancingContract::update_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Daily);
+            assert_eq!(res_up2, symbol_short!("ok"));
+
+            let schedule = RebalancingContract::get_schedule(env.clone(), portfolio.clone()).unwrap();
+            assert_eq!(schedule.interval, RebalanceInterval::Daily);
+
+            let res_cancel = RebalancingContract::cancel_schedule(env.clone(), portfolio.clone());
+            assert_eq!(res_cancel, symbol_short!("ok"));
+
+            assert!(RebalancingContract::get_schedule(env.clone(), portfolio.clone()).is_none());
+
+            let res_cancel2 = RebalancingContract::cancel_schedule(env.clone(), portfolio.clone());
+            assert_eq!(res_cancel2, symbol_short!("err_none"));
+        });
     }
 
     #[test]
     fn test_scheduled_rebalance_execution() {
-        let env = Env::default();
-        let portfolio = symbol_short!("port1");
-        
-        let res = RebalancingContract::check_and_execute_scheduled_rebalance(env.clone(), portfolio.clone());
-        assert_eq!(res, symbol_short!("err_none"));
-        
-        RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Hourly);
-        
-        let res_not_due = RebalancingContract::check_and_execute_scheduled_rebalance(env.clone(), portfolio.clone());
-        assert_eq!(res_not_due, symbol_short!("not_due"));
-        
-        let mut ledger_info = env.ledger().get();
-        ledger_info.timestamp = 3600;
-        env.ledger().set(ledger_info);
-        
-        let res_due = RebalancingContract::check_and_execute_scheduled_rebalance(env.clone(), portfolio.clone());
-        assert_eq!(res_due, symbol_short!("done"));
-        
-        let schedule = RebalancingContract::get_schedule(env.clone(), portfolio.clone()).unwrap();
-        assert_eq!(schedule.last_execution, 3600);
-        assert_eq!(schedule.next_execution, 7200);
-        
-        let history = RebalancingContract::get_execution_history(env.clone(), portfolio.clone());
-        assert_eq!(history.len(), 1);
-        let record = history.get(0).unwrap();
-        assert_eq!(record.timestamp, 3600);
-        assert_eq!(record.outcome, symbol_short!("done"));
-        assert_eq!(record.details, symbol_short!("sched_exec"));
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            let res = RebalancingContract::exec_scheduled_rebalance(env.clone(), portfolio.clone());
+            assert_eq!(res, symbol_short!("err_none"));
+
+            RebalancingContract::set_schedule(env.clone(), portfolio.clone(), RebalanceInterval::Hourly);
+
+            let res_not_due = RebalancingContract::exec_scheduled_rebalance(env.clone(), portfolio.clone());
+            assert_eq!(res_not_due, symbol_short!("not_due"));
+
+            let mut ledger_info = env.ledger().get();
+            ledger_info.timestamp = 3600;
+            env.ledger().set(ledger_info);
+
+            let res_due = RebalancingContract::exec_scheduled_rebalance(env.clone(), portfolio.clone());
+            assert_eq!(res_due, symbol_short!("done"));
+
+            let schedule = RebalancingContract::get_schedule(env.clone(), portfolio.clone()).unwrap();
+            assert_eq!(schedule.last_execution, 3600);
+            assert_eq!(schedule.next_execution, 7200);
+
+            let history = RebalancingContract::get_execution_history(env.clone(), portfolio.clone());
+            assert_eq!(history.len(), 1);
+            let record = history.get(0).unwrap();
+            assert_eq!(record.timestamp, 3600);
+            assert_eq!(record.outcome, symbol_short!("done"));
+            assert_eq!(record.details, symbol_short!("sched_ex"));
+        });
+    }
+
+    // ── Target allocation tests ──
+
+    #[test]
+    fn test_set_and_get_valid_allocation() {
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            let allocs = map![&env, (symbol_short!("BTC"), 4000u32), (symbol_short!("ETH"), 3000u32), (symbol_short!("SOL"), 3000u32)];
+            let allocation = TargetAllocation {
+                allocations: allocs,
+            };
+
+            let result = RebalancingContract::set_target_allocation(
+                env.clone(),
+                portfolio.clone(),
+                allocation,
+            );
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), symbol_short!("ok"));
+
+            let stored = RebalancingContract::get_target_allocation(env.clone(), portfolio.clone());
+            assert!(stored.is_some());
+
+            let stored_alloc = stored.unwrap();
+            assert_eq!(stored_alloc.allocations.len(), 3);
+            assert_eq!(stored_alloc.allocations.get(symbol_short!("BTC")).unwrap(), 4000);
+            assert_eq!(stored_alloc.allocations.get(symbol_short!("ETH")).unwrap(), 3000);
+            assert_eq!(stored_alloc.allocations.get(symbol_short!("SOL")).unwrap(), 3000);
+        });
+    }
+
+    #[test]
+    fn test_allocation_over_100_percent_rejected() {
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            // 60% + 55% = 115% → 11_500 bps, over the 10_000 limit
+            let allocs = map![&env, (symbol_short!("BTC"), 6000u32), (symbol_short!("ETH"), 5500u32)];
+            let allocation = TargetAllocation {
+                allocations: allocs,
+            };
+
+            let result = RebalancingContract::set_target_allocation(
+                env.clone(),
+                portfolio.clone(),
+                allocation,
+            );
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), RebalancingError::InvalidAllocation);
+
+            // Verify nothing was stored
+            let stored = RebalancingContract::get_target_allocation(env.clone(), portfolio.clone());
+            assert!(stored.is_none());
+        });
+    }
+
+    #[test]
+    fn test_allocation_under_100_percent_rejected() {
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            // 40% + 30% = 70% → 7_000 bps, under the 10_000 limit
+            let allocs = map![&env, (symbol_short!("BTC"), 4000u32), (symbol_short!("ETH"), 3000u32)];
+            let allocation = TargetAllocation {
+                allocations: allocs,
+            };
+
+            let result = RebalancingContract::set_target_allocation(
+                env.clone(),
+                portfolio.clone(),
+                allocation,
+            );
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), RebalancingError::InvalidAllocation);
+
+            // Verify nothing was stored
+            let stored = RebalancingContract::get_target_allocation(env.clone(), portfolio.clone());
+            assert!(stored.is_none());
+        });
+    }
+
+    #[test]
+    fn test_allocation_exactly_100_percent_accepted() {
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            // Single asset at 100%
+            let allocs = map![&env, (symbol_short!("BTC"), 10000u32)];
+            let allocation = TargetAllocation {
+                allocations: allocs,
+            };
+
+            let result = RebalancingContract::set_target_allocation(
+                env.clone(),
+                portfolio.clone(),
+                allocation,
+            );
+            assert!(result.is_ok());
+
+            let stored = RebalancingContract::get_target_allocation(env.clone(), portfolio.clone());
+            assert!(stored.is_some());
+        });
+    }
+
+    #[test]
+    fn test_get_allocation_returns_none_when_not_set() {
+        test_in_contract(|env| {
+            let portfolio = symbol_short!("port1");
+
+            let stored = RebalancingContract::get_target_allocation(env.clone(), portfolio.clone());
+            assert!(stored.is_none());
+        });
     }
 }
