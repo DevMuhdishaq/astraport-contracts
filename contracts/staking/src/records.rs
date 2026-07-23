@@ -134,3 +134,14 @@ pub enum YieldDataKey {
     /// The [`DistributionSchedule`] list for a `(staker, asset)` pair.
     Schedule(Address, Symbol),
 }
+
+/// Storage keys for the staking balance data.
+///
+/// Keeping keys in a single enum avoids stringly-typed lookups and keeps the
+/// storage layout easy to audit.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub enum StakeDataKey {
+    /// The current staking balance for a staker address.
+    Balance(Address),
+}

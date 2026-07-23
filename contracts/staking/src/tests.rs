@@ -27,10 +27,80 @@ fn test_initialize() {
 }
 
 #[test]
-fn test_get_balance() {
+fn test_get_balance_initial() {
     let env = Env::default();
-    let result = StakingContract::get_balance(env, symbol_short!("user"));
+    let staker = Address::generate(&env);
+    let result = StakingContract::get_balance(env, staker);
     assert_eq!(result, 0);
+}
+
+#[test]
+fn test_stake_and_unstake() {
+    let (env, client) = setup();
+    let staker = Address::generate(&env);
+
+    // Stake 100
+    let stake_result = client.stake(&staker, &100);
+    assert_eq!(stake_result, symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 100);
+
+    // Stake another 50
+    let stake_result2 = client.stake(&staker, &50);
+    assert_eq!(stake_result2, symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 150);
+
+    // Unstake 75
+    let unstake_result = client.unstake(&staker, &75);
+    assert_eq!(unstake_result, symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 75);
+
+    // Unstake remaining 75 (should remove the key)
+    let unstake_result2 = client.unstake(&staker, &75);
+    assert_eq!(unstake_result2, symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 0);
+}
+
+#[test]
+#[should_panic(expected = "InvalidStakeAmount")]
+fn test_stake_zero() {
+    let (env, client) = setup();
+    let staker = Address::generate(&env);
+    client.stake(&staker, &0);
+}
+
+#[test]
+#[should_panic(expected = "InvalidStakeAmount")]
+fn test_stake_negative() {
+    let (env, client) = setup();
+    let staker = Address::generate(&env);
+    client.stake(&staker, &-50);
+}
+
+#[test]
+#[should_panic(expected = "InsufficientBalance")]
+fn test_unstake_more_than_balance() {
+    let (env, client) = setup();
+    let staker = Address::generate(&env);
+    client.stake(&staker, &100);
+    client.unstake(&staker, &150);
+}
+
+#[test]
+#[should_panic(expected = "InvalidStakeAmount")]
+fn test_unstake_zero() {
+    let (env, client) = setup();
+    let staker = Address::generate(&env);
+    client.stake(&staker, &100);
+    client.unstake(&staker, &0);
+}
+
+#[test]
+#[should_panic(expected = "InvalidStakeAmount")]
+fn test_unstake_negative() {
+    let (env, client) = setup();
+    let staker = Address::generate(&env);
+    client.stake(&staker, &100);
+    client.unstake(&staker, &-50);
 }
 
 // --- helpers --------------------------------------------------------------
@@ -46,7 +116,14 @@ fn setup() -> (Env, StakingContractClient<'static>) {
 /// Assert `a` and `b` are within `tol`.
 fn approx(a: i128, b: i128, tol: i128) {
     let diff = (a - b).abs();
-    assert!(diff <= tol, "expected {} ~= {} within {}, diff {}", a, b, tol, diff);
+    assert!(
+        diff <= tol,
+        "expected {} ~= {} within {}, diff {}",
+        a,
+        b,
+        tol,
+        diff
+    );
 }
 
 // --- yield engine contract tests ------------------------------------------
@@ -80,7 +157,11 @@ fn accrual_over_one_year_daily() {
     let record = client.accrue_yield(&staker, &asset);
 
     // (1 + 0.05/365)^365 - 1 on 1e18 ~= 5.1267e16
-    approx(record.accrued_yield, 51_267_496_505_408_400, 100_000_000_000);
+    approx(
+        record.accrued_yield,
+        51_267_496_505_408_400,
+        100_000_000_000,
+    );
 }
 
 #[test]
@@ -193,7 +274,12 @@ fn thirty_day_projection_within_one_percent() {
     );
     let expected = 8_253_048_640_000_000i128; // e^(0.1*30/365) - 1 on 1e18
     let diff = (proj.projected_yield - expected).abs();
-    assert!(diff <= expected / 100, "projection off by >1%: {} vs {}", proj.projected_yield, expected);
+    assert!(
+        diff <= expected / 100,
+        "projection off by >1%: {} vs {}",
+        proj.projected_yield,
+        expected
+    );
     assert_eq!(proj.projected_balance, SCALE + proj.projected_yield);
 }
 

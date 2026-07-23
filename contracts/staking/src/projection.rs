@@ -66,7 +66,12 @@ mod tests {
         let expected = 8_253_048_640_000_000i128;
         let diff = (proj.projected_yield - expected).abs();
         // within 1% of expected
-        assert!(diff <= expected / 100, "diff {} exceeds 1% of {}", diff, expected);
+        assert!(
+            diff <= expected / 100,
+            "diff {} exceeds 1% of {}",
+            diff,
+            expected
+        );
         assert_eq!(proj.projected_balance, p + proj.projected_yield);
     }
 }
