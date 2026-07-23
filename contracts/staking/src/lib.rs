@@ -31,7 +31,8 @@ use crate::apy::APYCalculator;
 use crate::engine::YieldEngine;
 use crate::projection::YieldProjector;
 use crate::records::{
-    CompoundingMode, DistributionSchedule, YieldHistoryEntry, YieldProjection, YieldRecord,
+    CompoundingMode, DistributionSchedule, YieldDataKey, YieldHistoryEntry, YieldProjection,
+    YieldRecord,
 };
 
 /// Staking contract for AstraPort
@@ -41,18 +42,28 @@ pub struct StakingContract;
 
 #[contractimpl]
 impl StakingContract {
-    /// Initialize the staking contract
+    /// Initialize the staking contract with an admin.
+    ///
+    /// Can only be called once; subsequent calls will panic.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
+    /// * `admin` - The admin address to store
     ///
     /// # Returns
     /// Success symbol if initialization succeeds
-    pub fn initialize(_env: Env) -> Symbol {
+    pub fn initialize(env: Env, admin: Address) -> Symbol {
+        let storage = env.storage().persistent();
+        if storage.has(&YieldDataKey::Admin) {
+            panic!("already initialized");
+        }
+        storage.set(&YieldDataKey::Admin, &admin);
         symbol_short!("ok")
     }
 
-    /// Stake assets into the contract
+    /// Stake assets into the contract.
+    ///
+    /// Requires authorization from the staker.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -61,11 +72,17 @@ impl StakingContract {
     ///
     /// # Returns
     /// Success symbol if staking succeeds
-    pub fn stake(_env: Env, _staker: Symbol, _amount: i128) -> Symbol {
+    pub fn stake(env: Env, staker: Address, amount: i128) -> Symbol {
+        staker.require_auth();
+        let key = YieldDataKey::Balance(staker.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(current + amount));
         symbol_short!("done")
     }
 
-    /// Unstake assets from the contract
+    /// Unstake assets from the contract.
+    ///
+    /// Requires authorization from the staker.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -74,11 +91,16 @@ impl StakingContract {
     ///
     /// # Returns
     /// Success symbol if unstaking succeeds
-    pub fn unstake(_env: Env, _staker: Symbol, _amount: i128) -> Symbol {
+    pub fn unstake(env: Env, staker: Address, amount: i128) -> Symbol {
+        staker.require_auth();
+        let key = YieldDataKey::Balance(staker.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        assert!(current >= amount, "insufficient balance");
+        env.storage().persistent().set(&key, &(current - amount));
         symbol_short!("done")
     }
 
-    /// Get staking balance for an address
+    /// Get staking balance for an address.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -86,19 +108,33 @@ impl StakingContract {
     ///
     /// # Returns
     /// Current staking balance
-    pub fn get_balance(_env: Env, _staker: Symbol) -> i128 {
-        0
+    pub fn get_balance(env: Env, staker: Address) -> i128 {
+        let key = YieldDataKey::Balance(staker);
+        env.storage().persistent().get(&key).unwrap_or(0)
     }
 
-    /// Set alert threshold for staking changes
+    /// Set alert threshold for staking changes.
+    ///
+    /// Only callable by the admin set during `initialize`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
+    /// * `admin` - The admin address (must match the stored admin)
     /// * `threshold` - Alert threshold amount
     ///
     /// # Returns
     /// Success symbol if alert threshold is set
-    pub fn set_alert_threshold(_env: Env, _threshold: i128) -> Symbol {
+    pub fn set_alert_threshold(env: Env, admin: Address, threshold: i128) -> Symbol {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&YieldDataKey::Admin)
+            .expect("contract not initialized");
+        assert!(stored_admin == admin, "caller is not admin");
+        env.storage()
+            .persistent()
+            .set(&YieldDataKey::AlertThreshold, &threshold);
         symbol_short!("ok")
     }
 

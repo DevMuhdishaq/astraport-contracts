@@ -15,21 +15,58 @@ use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{symbol_short, Address, Env};
 
 use crate::fixed_point::{SCALE, SECONDS_PER_DAY, SECONDS_PER_YEAR};
-use crate::records::CompoundingMode;
+use crate::records::{CompoundingMode, YieldDataKey};
 
 // --- original smoke tests -------------------------------------------------
 
 #[test]
 fn test_initialize() {
     let env = Env::default();
-    let result = StakingContract::initialize(env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let result = client.initialize(&admin);
     assert_eq!(result, symbol_short!("ok"));
+}
+
+#[test]
+fn test_initialize_stores_admin() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    env.as_contract(&contract_id, || {
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&YieldDataKey::Admin)
+            .unwrap();
+        assert_eq!(stored, admin);
+    });
+}
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn test_initialize_cannot_reinitialize() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    let other_admin = Address::generate(&env);
+    client.initialize(&other_admin);
 }
 
 #[test]
 fn test_get_balance() {
     let env = Env::default();
-    let result = StakingContract::get_balance(env, symbol_short!("user"));
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+    let staker = Address::generate(&env);
+    let result = client.get_balance(&staker);
     assert_eq!(result, 0);
 }
 
@@ -47,6 +84,139 @@ fn setup() -> (Env, StakingContractClient<'static>) {
 fn approx(a: i128, b: i128, tol: i128) {
     let diff = (a - b).abs();
     assert!(diff <= tol, "expected {} ~= {} within {}, diff {}", a, b, tol, diff);
+}
+
+// --- authentication tests --------------------------------------------------
+
+#[test]
+fn test_stake_requires_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    client.stake(&staker, &1_000);
+    assert_eq!(client.get_balance(&staker), 1_000);
+}
+
+#[test]
+#[should_panic]
+fn test_stake_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    // No mock_auths — require_auth will fail
+    client.stake(&staker, &1_000);
+}
+
+#[test]
+fn test_unstake_requires_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    client.stake(&staker, &1_000);
+    client.unstake(&staker, &500);
+    assert_eq!(client.get_balance(&staker), 500);
+}
+
+#[test]
+#[should_panic]
+fn test_unstake_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    env.mock_all_auths();
+    client.stake(&staker, &1_000);
+
+    // Create a fresh env without auth mocking
+    let env2 = Env::default();
+    let contract_id2 = env2.register_contract(None, StakingContract);
+    let client2 = StakingContractClient::new(&env2, &contract_id2);
+    let admin2 = Address::generate(&env2);
+    client2.initialize(&admin2);
+    let staker2 = Address::generate(&env2);
+    // No mock_auths — should panic
+    client2.unstake(&staker2, &500);
+}
+
+#[test]
+#[should_panic(expected = "insufficient balance")]
+fn test_unstake_insufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    client.stake(&staker, &100);
+    client.unstake(&staker, &200);
+}
+
+#[test]
+fn test_stake_updates_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    assert_eq!(client.get_balance(&staker), 0);
+
+    client.stake(&staker, &1_000);
+    assert_eq!(client.get_balance(&staker), 1_000);
+
+    client.stake(&staker, &500);
+    assert_eq!(client.get_balance(&staker), 1_500);
+
+    client.unstake(&staker, &200);
+    assert_eq!(client.get_balance(&staker), 1_300);
+}
+
+#[test]
+fn test_set_alert_threshold_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    client.set_alert_threshold(&admin, &10_000);
+}
+
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_set_alert_threshold_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let non_admin = Address::generate(&env);
+    // Auth passes (mock_all_auths), but the admin check fails
+    client.set_alert_threshold(&non_admin, &10_000);
 }
 
 // --- yield engine contract tests ------------------------------------------

@@ -133,4 +133,10 @@ pub enum YieldDataKey {
     History(Address, Symbol),
     /// The [`DistributionSchedule`] list for a `(staker, asset)` pair.
     Schedule(Address, Symbol),
+    /// The contract admin address set during `initialize`.
+    Admin,
+    /// The staked balance for an address.
+    Balance(Address),
+    /// The alert threshold value.
+    AlertThreshold,
 }
