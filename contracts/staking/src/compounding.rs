@@ -85,7 +85,9 @@ fn daily_growth_factor(apr: i128, duration_seconds: u64) -> Result<i128, MathErr
     if remainder_seconds > 0 {
         let frac = fp::div(remainder_seconds as i128, SECONDS_PER_DAY as i128)?;
         let partial_interest = fp::mul(daily_rate, frac)?;
-        let partial_factor = ONE.checked_add(partial_interest).ok_or(MathError::Overflow)?;
+        let partial_factor = ONE
+            .checked_add(partial_interest)
+            .ok_or(MathError::Overflow)?;
         factor = fp::mul(factor, partial_factor)?;
     }
 
@@ -191,13 +193,23 @@ mod tests {
 
     fn approx(a: i128, b: i128, tol: i128) {
         let diff = (a - b).abs();
-        assert!(diff <= tol, "expected {} ~= {} within {}, diff {}", a, b, tol, diff);
+        assert!(
+            diff <= tol,
+            "expected {} ~= {} within {}, diff {}",
+            a,
+            b,
+            tol,
+            diff
+        );
     }
 
     #[test]
     fn zero_rate_yields_nothing() {
         let calc = YieldCalculator::new(Compounding::Daily);
-        assert_eq!(calc.compute_yield(1_000_000, 0, SECONDS_PER_YEAR).unwrap(), 0);
+        assert_eq!(
+            calc.compute_yield(1_000_000, 0, SECONDS_PER_YEAR).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -214,9 +226,11 @@ mod tests {
         let calc = YieldCalculator::new(Compounding::Daily);
         let principal = SCALE; // 1e18
         let apr = SCALE / 20; // 0.05
-        let earned = calc.compute_yield(principal, apr, SECONDS_PER_YEAR).unwrap();
+        let earned = calc
+            .compute_yield(principal, apr, SECONDS_PER_YEAR)
+            .unwrap();
         let expected = 51_267_496_505_408_400i128; // ~0.05126749650...
-        // within 1e-6 relative -> tol 1e11 on 1e18 scale
+                                                   // within 1e-6 relative -> tol 1e11 on 1e18 scale
         approx(earned, expected, 100_000_000_000);
     }
 
@@ -226,7 +240,9 @@ mod tests {
         let calc = YieldCalculator::new(Compounding::Continuous);
         let principal = SCALE;
         let apr = SCALE / 20;
-        let earned = calc.compute_yield(principal, apr, SECONDS_PER_YEAR).unwrap();
+        let earned = calc
+            .compute_yield(principal, apr, SECONDS_PER_YEAR)
+            .unwrap();
         let expected = 51_271_096_376_024_040i128; // e^0.05 - 1
         approx(earned, expected, 100_000_000_000);
     }
@@ -242,7 +258,12 @@ mod tests {
         let cont = YieldCalculator::new(Compounding::Continuous)
             .compute_yield(principal, apr, SECONDS_PER_YEAR)
             .unwrap();
-        assert!(cont >= daily, "continuous {} should be >= daily {}", cont, daily);
+        assert!(
+            cont >= daily,
+            "continuous {} should be >= daily {}",
+            cont,
+            daily
+        );
     }
 
     #[test]

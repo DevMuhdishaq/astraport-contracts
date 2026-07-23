@@ -132,7 +132,14 @@ mod tests {
 
     fn approx(a: i128, b: i128, tol: i128) {
         let diff = (a - b).abs();
-        assert!(diff <= tol, "expected {} ~= {} within {}, diff {}", a, b, tol, diff);
+        assert!(
+            diff <= tol,
+            "expected {} ~= {} within {}, diff {}",
+            a,
+            b,
+            tol,
+            diff
+        );
     }
 
     #[test]

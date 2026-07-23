@@ -242,9 +242,7 @@ pub fn exp(x: i128) -> Result<i128, MathError> {
     for n in 1..=20u64 {
         term = mul(term, reduced)?;
         term /= n as i128;
-        sum = sum
-            .checked_add(term)
-            .ok_or(MathError::Overflow)?;
+        sum = sum.checked_add(term).ok_or(MathError::Overflow)?;
         if term == 0 {
             break;
         }
@@ -318,7 +316,11 @@ mod tests {
         assert_eq!(pow_uint(5 * ONE, 0).unwrap(), ONE);
         // (1.05)^2 = 1.1025
         let base = ONE + SCALE / 20; // 1.05
-        approx(pow_uint(base, 2).unwrap(), 11_025 * SCALE / 10_000, SCALE / 1_000_000);
+        approx(
+            pow_uint(base, 2).unwrap(),
+            11_025 * SCALE / 10_000,
+            SCALE / 1_000_000,
+        );
     }
 
     #[test]

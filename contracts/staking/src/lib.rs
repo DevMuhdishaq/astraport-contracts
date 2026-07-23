@@ -18,7 +18,9 @@
 //! - [`projection`] — [`projection::YieldProjector`] for future-earnings
 //!   estimates.
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+};
 
 pub mod apy;
 pub mod compounding;
@@ -32,14 +34,38 @@ use crate::engine::YieldEngine;
 use crate::fixed_point::SCALE;
 use crate::projection::YieldProjector;
 use crate::records::{
-    CompoundingMode, DistributionSchedule, YieldDataKey, YieldHistoryEntry, YieldProjection,
+    CompoundingMode, DistributionSchedule, StakeDataKey, YieldHistoryEntry, YieldProjection,
     YieldRecord,
 };
 
-/// Default APR seeded onto a newly opened yield position: 5% (fixed-point).
-const DEFAULT_APR: i128 = SCALE / 20;
-/// Default compounding mode seeded onto a newly opened yield position.
-const DEFAULT_MODE: CompoundingMode = CompoundingMode::Daily;
+/// Errors returned by the staking contract.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// Invalid amount: must be positive for staking.
+    InvalidStakeAmount = 1,
+    /// Insufficient balance: cannot unstake more than currently staked.
+    InsufficientBalance = 2,
+}
+
+/// Event emitted when assets are staked
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct StakeEvent {
+    pub staker: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+/// Event emitted when assets are unstaked
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct UnstakeEvent {
+    pub staker: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
 
 /// Staking contract for AstraPort
 /// Manages staking operations, alert functionality, and yield calculation.
@@ -79,12 +105,26 @@ impl StakingContract {
     ///
     /// # Returns
     /// Success symbol if staking succeeds
-    pub fn stake(env: Env, staker: Address, amount: i128) -> Symbol {
-        staker.require_auth();
-        let key = YieldDataKey::Balance(staker.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(current + amount));
-        symbol_short!("done")
+    pub fn stake(env: Env, staker: Address, amount: i128) -> Result<Symbol, Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidStakeAmount);
+        }
+        // Get current balance
+        let key = StakeDataKey::Balance(staker.clone());
+        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_balance = current_balance + amount;
+        // Persist new balance
+        env.storage().persistent().set(&key, &new_balance);
+        // Publish event
+        env.events().publish(
+            (symbol_short!("stake"), staker.clone()),
+            StakeEvent {
+                staker,
+                amount,
+                new_balance,
+            },
+        );
+        Ok(symbol_short!("done"))
     }
 
     /// Unstake assets from the contract.
@@ -98,13 +138,33 @@ impl StakingContract {
     ///
     /// # Returns
     /// Success symbol if unstaking succeeds
-    pub fn unstake(env: Env, staker: Address, amount: i128) -> Symbol {
-        staker.require_auth();
-        let key = YieldDataKey::Balance(staker.clone());
-        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        assert!(current >= amount, "insufficient balance");
-        env.storage().persistent().set(&key, &(current - amount));
-        symbol_short!("done")
+    pub fn unstake(env: Env, staker: Address, amount: i128) -> Result<Symbol, Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidStakeAmount);
+        }
+        // Get current balance
+        let key = StakeDataKey::Balance(staker.clone());
+        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if amount > current_balance {
+            return Err(Error::InsufficientBalance);
+        }
+        let new_balance = current_balance - amount;
+        // Persist new balance
+        if new_balance == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &new_balance);
+        }
+        // Publish event
+        env.events().publish(
+            (symbol_short!("unstake"), staker.clone()),
+            UnstakeEvent {
+                staker,
+                amount,
+                new_balance,
+            },
+        );
+        Ok(symbol_short!("done"))
     }
 
     /// Get staking balance for an address.
@@ -115,7 +175,7 @@ impl StakingContract {
     /// # Returns
     /// Current staking balance
     pub fn get_balance(env: Env, staker: Address) -> i128 {
-        let key = YieldDataKey::Balance(staker);
+        let key = StakeDataKey::Balance(staker);
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 

@@ -147,7 +147,11 @@ pub struct TriggerEvaluator;
 
 impl TriggerEvaluator {
     /// Evaluate if a trigger's conditions are met
-    pub fn evaluate(trigger: &AITrigger, event_type: EventType, current_value: Option<U256>) -> bool {
+    pub fn evaluate(
+        trigger: &AITrigger,
+        event_type: EventType,
+        current_value: Option<U256>,
+    ) -> bool {
         // First check if this event type is in the trigger's supported events
         let event_type_matches = trigger.event_types.contains(event_type as u32);
         if !event_type_matches {
@@ -258,7 +262,11 @@ impl AIServiceClient for SorobanAIServiceClient {
 
         // Emit event that analysis was submitted
         env.events().publish(
-            (symbol_short!("ANAL_SUB"), portfolio_id, trigger.trigger_id.clone()),
+            (
+                symbol_short!("ANAL_SUB"),
+                portfolio_id,
+                trigger.trigger_id.clone(),
+            ),
             analysis_id,
         );
 
@@ -374,7 +382,9 @@ impl EventsContract {
         // Initialize metrics if not already set
         if !env.storage().persistent().has(&storage_keys::metrics()) {
             let metrics = AnalysisMetrics::default();
-            env.storage().persistent().set(&storage_keys::metrics(), &metrics);
+            env.storage()
+                .persistent()
+                .set(&storage_keys::metrics(), &metrics);
         }
         OK
     }
@@ -405,7 +415,9 @@ impl EventsContract {
         }
 
         triggers.set(trigger_id.clone(), trigger);
-        env.storage().persistent().set(&storage_keys::triggers(), &triggers);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::triggers(), &triggers);
 
         // Emit trigger added event
         env.events().publish((TRIG_ADD,), trigger_id);
@@ -430,9 +442,12 @@ impl EventsContract {
         }
 
         triggers.remove(trigger_id.clone());
-        env.storage().persistent().set(&storage_keys::triggers(), &triggers);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::triggers(), &triggers);
 
-        env.events().publish((symbol_short!("TRIG_RMV"),), trigger_id);
+        env.events()
+            .publish((symbol_short!("TRIG_RMV"),), trigger_id);
 
         Ok(OK)
     }
@@ -463,8 +478,11 @@ impl EventsContract {
             .unwrap_or_else(|| Map::new(&env));
 
         let mut triggered_analyses = Vec::new(&env);
-        let mut metrics: AnalysisMetrics =
-            env.storage().persistent().get(&storage_keys::metrics()).unwrap_or_default();
+        let mut metrics: AnalysisMetrics = env
+            .storage()
+            .persistent()
+            .get(&storage_keys::metrics())
+            .unwrap_or_default();
 
         // Check each active trigger
         for (trigger_id, trigger) in triggers.iter() {
@@ -501,12 +519,15 @@ impl EventsContract {
                         };
 
                         analyses.set(analysis_id, analysis);
-                        env.storage().persistent().set(&storage_keys::analyses(), &analyses);
-
-                        // Store status for tracking
                         env.storage()
                             .persistent()
-                            .set(&storage_keys::analysis_status(analysis_id), &(AnalysisStatus::Pending as u32));
+                            .set(&storage_keys::analyses(), &analyses);
+
+                        // Store status for tracking
+                        env.storage().persistent().set(
+                            &storage_keys::analysis_status(analysis_id),
+                            &(AnalysisStatus::Pending as u32),
+                        );
 
                         // Update metrics
                         metrics.total_analyses += 1;
@@ -514,18 +535,24 @@ impl EventsContract {
                         triggered_analyses.push_back(analysis_id);
 
                         // Emit analysis triggered event
-                        env.events().publish((ANALYSIS, portfolio_id.clone(), trigger_id.clone()), analysis_id);
+                        env.events().publish(
+                            (ANALYSIS, portfolio_id.clone(), trigger_id.clone()),
+                            analysis_id,
+                        );
                     }
                     Err(e) => {
                         // Log the error but continue processing other triggers
-                        env.events().publish((symbol_short!("ERROR"), trigger_id.clone()), e);
+                        env.events()
+                            .publish((symbol_short!("ERROR"), trigger_id.clone()), e);
                     }
                 }
             }
         }
 
         // Save updated metrics
-        env.storage().persistent().set(&storage_keys::metrics(), &metrics);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::metrics(), &metrics);
 
         Ok(triggered_analyses)
     }
@@ -561,12 +588,19 @@ impl EventsContract {
         analysis.error_message = error;
 
         analyses.set(analysis_id, analysis.clone());
-        env.storage().persistent().set(&storage_keys::analyses(), &analyses);
-        env.storage().persistent().set(&storage_keys::analysis_status(analysis_id), &status);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::analyses(), &analyses);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::analysis_status(analysis_id), &status);
 
         // Update metrics
-        let mut metrics: AnalysisMetrics =
-            env.storage().persistent().get(&storage_keys::metrics()).unwrap_or_default();
+        let mut metrics: AnalysisMetrics = env
+            .storage()
+            .persistent()
+            .get(&storage_keys::metrics())
+            .unwrap_or_default();
 
         match new_status {
             AnalysisStatus::Completed => {
@@ -584,7 +618,9 @@ impl EventsContract {
             _ => {}
         }
 
-        env.storage().persistent().set(&storage_keys::metrics(), &metrics);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::metrics(), &metrics);
 
         // If analysis completed successfully, generate recommendation
         if new_status == AnalysisStatus::Completed {
@@ -592,7 +628,10 @@ impl EventsContract {
             let mut ai_output: Map<Symbol, u32> = Map::new(&env);
             if analysis.raw_output.len() > 0 {
                 // In real implementation, properly deserialize the output
-                ai_output.set(symbol_short!("action"), analysis.raw_output.get(0).unwrap_or(0) as u32);
+                ai_output.set(
+                    symbol_short!("action"),
+                    analysis.raw_output.get(0).unwrap_or(0) as u32,
+                );
                 ai_output.set(symbol_short!("conf"), 85); // Example confidence score
             }
 
@@ -607,7 +646,9 @@ impl EventsContract {
 
                 let rec_id = recommendation.recommendation_id;
                 recommendations.set(rec_id, recommendation);
-                env.storage().persistent().set(&storage_keys::recommendations(), &recommendations);
+                env.storage()
+                    .persistent()
+                    .set(&storage_keys::recommendations(), &recommendations);
 
                 env.events()
                     .publish((RECOMMEND, analysis.portfolio_id, analysis_id), rec_id);
@@ -638,16 +679,24 @@ impl EventsContract {
         analysis.error_message = Some(TIMEOUT);
 
         analyses.set(analysis_id, analysis);
-        env.storage().persistent().set(&storage_keys::analyses(), &analyses);
         env.storage()
             .persistent()
-            .set(&storage_keys::analysis_status(analysis_id), &(AnalysisStatus::TimedOut as u32));
+            .set(&storage_keys::analyses(), &analyses);
+        env.storage().persistent().set(
+            &storage_keys::analysis_status(analysis_id),
+            &(AnalysisStatus::TimedOut as u32),
+        );
 
         // Update metrics
-        let mut metrics: AnalysisMetrics =
-            env.storage().persistent().get(&storage_keys::metrics()).unwrap_or_default();
+        let mut metrics: AnalysisMetrics = env
+            .storage()
+            .persistent()
+            .get(&storage_keys::metrics())
+            .unwrap_or_default();
         metrics.timed_out_analyses += 1;
-        env.storage().persistent().set(&storage_keys::metrics(), &metrics);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::metrics(), &metrics);
 
         env.events().publish((TIMEOUT,), analysis_id);
 
@@ -669,21 +718,30 @@ impl EventsContract {
             .get(&storage_keys::recommendations())
             .ok_or(Error::NotFound)?;
 
-        let mut rec = recommendations.get(recommendation_id).ok_or(Error::NotFound)?;
+        let mut rec = recommendations
+            .get(recommendation_id)
+            .ok_or(Error::NotFound)?;
         rec.accepted = Some(accepted);
 
         recommendations.set(recommendation_id, rec);
-        env.storage().persistent().set(&storage_keys::recommendations(), &recommendations);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::recommendations(), &recommendations);
 
         // Update metrics
-        let mut metrics: AnalysisMetrics =
-            env.storage().persistent().get(&storage_keys::metrics()).unwrap_or_default();
+        let mut metrics: AnalysisMetrics = env
+            .storage()
+            .persistent()
+            .get(&storage_keys::metrics())
+            .unwrap_or_default();
         if accepted {
             metrics.recommendations_accepted += 1;
         } else {
             metrics.recommendations_rejected += 1;
         }
-        env.storage().persistent().set(&storage_keys::metrics(), &metrics);
+        env.storage()
+            .persistent()
+            .set(&storage_keys::metrics(), &metrics);
 
         Ok(OK)
     }
@@ -724,7 +782,10 @@ impl EventsContract {
 
     /// Get current analysis metrics
     pub fn get_metrics(env: Env) -> AnalysisMetrics {
-        env.storage().persistent().get(&storage_keys::metrics()).unwrap_or_default()
+        env.storage()
+            .persistent()
+            .get(&storage_keys::metrics())
+            .unwrap_or_default()
     }
 
     /// Subscribe to portfolio events
@@ -747,7 +808,11 @@ impl EventsContract {
     }
 
     /// Unsubscribe from portfolio events
-    pub fn unsubscribe(env: Env, portfolio_id: Symbol, subscriber: Address) -> Result<Symbol, Error> {
+    pub fn unsubscribe(
+        env: Env,
+        portfolio_id: Symbol,
+        subscriber: Address,
+    ) -> Result<Symbol, Error> {
         subscriber.require_auth();
 
         let subs_key = storage_keys::subscribers(portfolio_id);
@@ -915,7 +980,10 @@ mod tests {
         // Verify the analysis was stored
         let portfolio_analyses = EventsContract::get_portfolio_analyses(env.clone(), portfolio_id);
         assert_eq!(portfolio_analyses.len(), 1);
-        assert_eq!(portfolio_analyses.get(0).unwrap().status, AnalysisStatus::Pending as u32);
+        assert_eq!(
+            portfolio_analyses.get(0).unwrap().status,
+            AnalysisStatus::Pending as u32
+        );
     }
 
     #[test]
@@ -1015,8 +1083,14 @@ mod tests {
 
         // Verify analysis is marked as timed out
         let portfolio_analyses = EventsContract::get_portfolio_analyses(env.clone(), portfolio_id);
-        assert_eq!(portfolio_analyses.get(0).unwrap().status, AnalysisStatus::TimedOut as u32);
-        assert_eq!(portfolio_analyses.get(0).unwrap().error_message, Some(TIMEOUT));
+        assert_eq!(
+            portfolio_analyses.get(0).unwrap().status,
+            AnalysisStatus::TimedOut as u32
+        );
+        assert_eq!(
+            portfolio_analyses.get(0).unwrap().error_message,
+            Some(TIMEOUT)
+        );
 
         // Check metrics
         let metrics = EventsContract::get_metrics(env.clone());
