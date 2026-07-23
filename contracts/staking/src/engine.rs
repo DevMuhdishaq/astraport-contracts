@@ -184,6 +184,7 @@ impl<'a> YieldEngine<'a> {
                 apr: record.apr,
                 yield_earned: earned,
                 cumulative_yield: cumulative,
+                is_claim: false,
             },
         );
 
@@ -191,6 +192,31 @@ impl<'a> YieldEngine<'a> {
         updated.accrued_yield = cumulative;
         updated.last_accrual_ts = now;
         Ok(updated)
+    }
+
+    /// Finalize a claim after [`Self::accrue`] has checkpointed the position.
+    ///
+    /// The marker is deliberately zero-period: the accrual entry (if any)
+    /// remains an immutable account of what was earned, while this entry records
+    /// that the accumulated amount was paid out and resets the unclaimed total.
+    pub(crate) fn finalize_claim(&self, mut record: YieldRecord) -> i128 {
+        let claimed = record.accrued_yield;
+        record.accrued_yield = 0;
+
+        self.append_history(
+            &record.staker,
+            &record.asset,
+            YieldHistoryEntry {
+                timestamp: self.env.ledger().timestamp(),
+                period_seconds: 0,
+                apr: record.apr,
+                yield_earned: 0,
+                cumulative_yield: 0,
+                is_claim: true,
+            },
+        );
+        self.store_record(&record);
+        claimed
     }
 
     // --- history ---------------------------------------------------------

@@ -200,6 +200,25 @@ impl StakingContract {
             .expect("failed to accrue yield")
     }
 
+    /// Claim all yield accrued by a staker for an asset.
+    ///
+    /// The position is first checkpointed to the current ledger time. The full
+    /// checkpointed amount is returned, its unclaimed counter is reset to zero,
+    /// and a zero-period claim marker is appended to yield history.
+    pub fn claim_yield(env: Env, staker: Address, asset: Symbol) -> i128 {
+        staker.require_auth();
+
+        let engine = YieldEngine::new(&env);
+        let record = engine
+            .accrue(&staker, &asset)
+            .expect("failed to accrue yield before claim");
+        let claimed = engine.finalize_claim(record);
+
+        env.events()
+            .publish((symbol_short!("YLDCLAIM"), staker, asset), claimed);
+        claimed
+    }
+
     /// The total yield a position has earned as of now (checkpointed plus
     /// pending), without mutating storage.
     pub fn current_yield(env: Env, staker: Address, asset: Symbol) -> i128 {
