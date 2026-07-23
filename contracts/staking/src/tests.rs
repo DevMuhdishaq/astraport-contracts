@@ -15,14 +15,17 @@ use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{symbol_short, Address, Env};
 
 use crate::fixed_point::{SCALE, SECONDS_PER_DAY, SECONDS_PER_YEAR};
-use crate::records::CompoundingMode;
+use crate::records::{CompoundingMode, YieldDataKey};
 
 // --- original smoke tests -------------------------------------------------
 
 #[test]
 fn test_initialize() {
     let env = Env::default();
-    let result = StakingContract::initialize(env);
+    let admin = Address::generate(&env);
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let result = client.initialize(&admin);
     assert_eq!(result, symbol_short!("ok"));
 }
 
@@ -124,6 +127,139 @@ fn approx(a: i128, b: i128, tol: i128) {
         tol,
         diff
     );
+}
+
+// --- authentication tests --------------------------------------------------
+
+#[test]
+fn test_stake_requires_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    client.stake(&staker, &1_000);
+    assert_eq!(client.get_balance(&staker), 1_000);
+}
+
+#[test]
+#[should_panic]
+fn test_stake_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    // No mock_auths — require_auth will fail
+    client.stake(&staker, &1_000);
+}
+
+#[test]
+fn test_unstake_requires_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    client.stake(&staker, &1_000);
+    client.unstake(&staker, &500);
+    assert_eq!(client.get_balance(&staker), 500);
+}
+
+#[test]
+#[should_panic]
+fn test_unstake_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    env.mock_all_auths();
+    client.stake(&staker, &1_000);
+
+    // Create a fresh env without auth mocking
+    let env2 = Env::default();
+    let contract_id2 = env2.register_contract(None, StakingContract);
+    let client2 = StakingContractClient::new(&env2, &contract_id2);
+    let admin2 = Address::generate(&env2);
+    client2.initialize(&admin2);
+    let staker2 = Address::generate(&env2);
+    // No mock_auths — should panic
+    client2.unstake(&staker2, &500);
+}
+
+#[test]
+#[should_panic(expected = "insufficient balance")]
+fn test_unstake_insufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    client.stake(&staker, &100);
+    client.unstake(&staker, &200);
+}
+
+#[test]
+fn test_stake_updates_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let staker = Address::generate(&env);
+    assert_eq!(client.get_balance(&staker), 0);
+
+    client.stake(&staker, &1_000);
+    assert_eq!(client.get_balance(&staker), 1_000);
+
+    client.stake(&staker, &500);
+    assert_eq!(client.get_balance(&staker), 1_500);
+
+    client.unstake(&staker, &200);
+    assert_eq!(client.get_balance(&staker), 1_300);
+}
+
+#[test]
+fn test_set_alert_threshold_requires_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    client.set_alert_threshold(&admin, &10_000);
+}
+
+#[test]
+#[should_panic(expected = "caller is not admin")]
+fn test_set_alert_threshold_non_admin_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let non_admin = Address::generate(&env);
+    // Auth passes (mock_all_auths), but the admin check fails
+    client.set_alert_threshold(&non_admin, &10_000);
 }
 
 // --- yield engine contract tests ------------------------------------------
@@ -338,6 +474,104 @@ fn apy_apr_roundtrip_via_contract() {
 }
 
 #[test]
+fn stake_opens_position_and_accrues_on_staked_principal() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    // Staking wires the deposit into the yield engine at the default params
+    // (5% APR, daily), and the returned/queried balance reflects the stake.
+    let balance = client.stake(&staker, &asset, &SCALE);
+    assert_eq!(balance, SCALE);
+    assert_eq!(client.get_balance(&staker, &asset), SCALE);
+
+    // Yield accrues on the actual staked principal.
+    env.ledger().set_timestamp(SECONDS_PER_YEAR);
+    let yielded = client.current_yield(&staker, &asset);
+    // (1 + 0.05/365)^365 - 1 on 1e18 ~= 5.1267e16
+    approx(yielded, 51_267_496_505_408_400, 100_000_000_000);
+}
+
+#[test]
+fn additional_stake_raises_principal_and_keeps_yield() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    client.stake(&staker, &asset, &SCALE);
+
+    // After a year, stake more. This must checkpoint accrued yield first.
+    env.ledger().set_timestamp(SECONDS_PER_YEAR);
+    let new_balance = client.stake(&staker, &asset, &SCALE);
+    assert_eq!(new_balance, 2 * SCALE);
+
+    // Principal now equals the staked balance; realized yield is preserved.
+    let rec = client.accrue_yield(&staker, &asset);
+    assert_eq!(rec.principal, 2 * SCALE);
+    approx(rec.accrued_yield, 51_267_496_505_408_400, 100_000_000_000);
+}
+
+#[test]
+fn unstake_preserves_accrued_yield_and_reduces_principal() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    // Stake 1e18 and let a full year of yield accrue.
+    client.stake(&staker, &asset, &SCALE);
+    env.ledger().set_timestamp(SECONDS_PER_YEAR);
+    let expected_yield = 51_267_496_505_408_400i128; // 5% daily on 1e18
+
+    // Unstake half. This checkpoints accrued yield before dropping principal.
+    let remaining = client.unstake(&staker, &asset, &(SCALE / 2));
+    assert_eq!(remaining, SCALE / 2);
+    assert_eq!(client.get_balance(&staker, &asset), SCALE / 2);
+
+    // Accrued yield is preserved and principal is reduced (accrue at the same
+    // timestamp is a no-op, so it just returns the stored record).
+    let rec = client.accrue_yield(&staker, &asset);
+    assert_eq!(rec.principal, SCALE / 2);
+    approx(rec.accrued_yield, expected_yield, 100_000_000_000);
+
+    // Going forward, further yield accrues on the reduced principal on top of
+    // the preserved amount.
+    env.ledger().set_timestamp(2 * SECONDS_PER_YEAR);
+    let total = client.current_yield(&staker, &asset);
+    // preserved + second-year yield on half the principal (~2.5634e16).
+    approx(total, expected_yield + 25_633_748_252_704_200, 100_000_000_000);
+}
+
+#[test]
+fn configured_yield_defaults_apply_to_new_positions() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("USDC");
+
+    // Reconfigure defaults to 10% continuous before the first stake.
+    client.set_yield_defaults(&(SCALE / 10), &CompoundingMode::Continuous);
+    client.stake(&staker, &asset, &SCALE);
+
+    env.ledger().set_timestamp(SECONDS_PER_YEAR / 2);
+    let mid = client.current_yield(&staker, &asset);
+    // e^(0.1*0.5) - 1 = e^0.05 - 1 on 1e18
+    approx(mid, 51_271_096_376_024_040, 100_000_000_000);
+}
+
+#[test]
+#[should_panic(expected = "invalid unstake amount")]
+fn unstake_more_than_staked_panics() {
+    let (env, client) = setup();
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+    client.stake(&staker, &asset, &SCALE);
+    client.unstake(&staker, &asset, &(SCALE + 1));
+}
+
+#[test]
 fn zero_principal_accrues_nothing() {
     let (env, client) = setup();
     env.ledger().set_timestamp(0);
@@ -347,4 +581,62 @@ fn zero_principal_accrues_nothing() {
     env.ledger().set_timestamp(SECONDS_PER_YEAR);
     let rec = client.accrue_yield(&staker, &asset);
     assert_eq!(rec.accrued_yield, 0);
+}
+
+// --- yield claiming -------------------------------------------------------
+
+#[test]
+fn accrue_claim_and_reclaim_resets_unclaimed_yield() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    client.open_yield_position(
+        &staker,
+        &asset,
+        &SCALE,
+        &(SCALE / 10),
+        &CompoundingMode::Daily,
+    );
+
+    // Checkpoint earnings, then claim exactly the checkpointed amount.
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+    let accrued = client.accrue_yield(&staker, &asset).accrued_yield;
+    assert!(accrued > 0);
+
+    env.mock_all_auths();
+    assert_eq!(client.claim_yield(&staker, &asset), accrued);
+    assert_eq!(client.current_yield(&staker, &asset), 0);
+
+    // No time has elapsed, so a second claim cannot pay the same yield twice.
+    assert_eq!(client.claim_yield(&staker, &asset), 0);
+
+    let history = client.yield_history(&staker, &asset);
+    assert_eq!(history.len(), 3);
+    let claim = history.get(1).unwrap();
+    assert!(claim.is_claim);
+    assert_eq!(claim.period_seconds, 0);
+    assert_eq!(claim.yield_earned, 0);
+    assert_eq!(claim.cumulative_yield, 0);
+}
+
+#[test]
+#[should_panic]
+fn claim_yield_requires_staker_auth() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    client.open_yield_position(
+        &staker,
+        &asset,
+        &SCALE,
+        &(SCALE / 10),
+        &CompoundingMode::Daily,
+    );
+
+    // No mock authorization is supplied for `staker`.
+    client.claim_yield(&staker, &asset);
 }
