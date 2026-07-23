@@ -35,9 +35,10 @@ AstraPort Smart Contracts is a suite of Soroban-based smart contracts built on t
 - **Purpose**: Manages staking operations, alerts, and yield calculation
 - **Key Functions**:
   - `initialize()` - Initialize the contract
-  - `stake()` - Stake assets
-  - `unstake()` - Unstake assets
-  - `get_balance()` - Query staking balance
+  - `stake()` - Stake assets; opens or grows the staker/asset yield position so its principal tracks the staked balance
+  - `unstake()` - Unstake assets; checkpoints accrued yield before reducing principal so no yield is lost
+  - `get_balance()` - Query the staked balance for a staker/asset pair
+  - `set_yield_defaults()` - Configure the default APR and compounding mode seeded onto newly opened positions
   - `set_alert_threshold()` - Configure alert thresholds
 - **Yield Engine Functions**:
   - `open_yield_position()` - Start accruing yield for a staker/asset at a given APR and compounding mode
