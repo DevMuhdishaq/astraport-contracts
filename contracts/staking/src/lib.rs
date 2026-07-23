@@ -32,8 +32,8 @@ use crate::engine::YieldEngine;
 use crate::fixed_point::SCALE;
 use crate::projection::YieldProjector;
 use crate::records::{
-    CompoundingMode, DistributionSchedule, StakeDataKey, StakingConfig, YieldHistoryEntry,
-    YieldProjection, YieldRecord,
+    CompoundingMode, DistributionSchedule, YieldDataKey, YieldHistoryEntry, YieldProjection,
+    YieldRecord,
 };
 
 /// Default APR seeded onto a newly opened yield position: 5% (fixed-point).
@@ -48,19 +48,28 @@ pub struct StakingContract;
 
 #[contractimpl]
 impl StakingContract {
-    /// Initialize the staking contract
+    /// Initialize the staking contract with an admin.
+    ///
+    /// Can only be called once; subsequent calls will panic.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
+    /// * `admin` - The admin address to store
     ///
     /// # Returns
     /// Success symbol if initialization succeeds
-    pub fn initialize(_env: Env) -> Symbol {
+    pub fn initialize(env: Env, admin: Address) -> Symbol {
+        let storage = env.storage().persistent();
+        if storage.has(&YieldDataKey::Admin) {
+            panic!("already initialized");
+        }
+        storage.set(&YieldDataKey::Admin, &admin);
         symbol_short!("ok")
     }
 
-    /// Stake `amount` of `asset` for `staker`, wiring the deposit into the yield
-    /// engine so the position's principal always equals the staked balance.
+    /// Stake assets into the contract.
+    ///
+    /// Requires authorization from the staker.
     ///
     /// If this is the first stake for the pair, a yield position is opened at the
     /// configured default APR / compounding mode (see [`Self::set_yield_defaults`]).
@@ -69,97 +78,69 @@ impl StakingContract {
     /// realized yield.
     ///
     /// # Returns
-    /// The staker's new staked balance for the asset.
-    pub fn stake(env: Env, staker: Address, asset: Symbol, amount: i128) -> i128 {
-        if amount <= 0 {
-            panic!("stake amount must be positive");
-        }
-        let new_balance = Self::balance_of(&env, &staker, &asset)
-            .checked_add(amount)
-            .expect("stake balance overflow");
-
-        let engine = YieldEngine::new(&env);
-        match engine.load_record(&staker, &asset) {
-            // Existing position: checkpoint, then raise principal (keeps its rate).
-            Some(_) => {
-                engine
-                    .set_principal(&staker, &asset, new_balance)
-                    .expect("failed to adjust yield principal on stake");
-            }
-            // First stake: open a position seeded with the default parameters.
-            None => {
-                let config = Self::load_config(&env);
-                engine
-                    .open_position(
-                        &staker,
-                        &asset,
-                        new_balance,
-                        config.default_apr,
-                        config.default_mode,
-                    )
-                    .expect("failed to open yield position on stake");
-            }
-        }
-
-        Self::set_balance(&env, &staker, &asset, new_balance);
-        new_balance
+    /// Success symbol if staking succeeds
+    pub fn stake(env: Env, staker: Address, amount: i128) -> Symbol {
+        staker.require_auth();
+        let key = YieldDataKey::Balance(staker.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(current + amount));
+        symbol_short!("done")
     }
 
-    /// Unstake `amount` of `asset` for `staker`, checkpointing accrued yield
-    /// before reducing the position's principal so no earned yield is lost.
+    /// Unstake assets from the contract.
+    ///
+    /// Requires authorization from the staker.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `staker` - Address of the staker
+    /// * `amount` - Amount to unstake
     ///
     /// # Returns
-    /// The staker's remaining staked balance for the asset.
-    pub fn unstake(env: Env, staker: Address, asset: Symbol, amount: i128) -> i128 {
-        let current = Self::balance_of(&env, &staker, &asset);
-        if amount <= 0 || amount > current {
-            panic!("invalid unstake amount");
-        }
-        let new_balance = current - amount;
-
-        // set_principal accrues (checkpoints) at the current rate *before* the
-        // principal drops, so realized yield is preserved.
-        YieldEngine::new(&env)
-            .set_principal(&staker, &asset, new_balance)
-            .expect("failed to adjust yield principal on unstake");
-
-        Self::set_balance(&env, &staker, &asset, new_balance);
-        new_balance
+    /// Success symbol if unstaking succeeds
+    pub fn unstake(env: Env, staker: Address, amount: i128) -> Symbol {
+        staker.require_auth();
+        let key = YieldDataKey::Balance(staker.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        assert!(current >= amount, "insufficient balance");
+        env.storage().persistent().set(&key, &(current - amount));
+        symbol_short!("done")
     }
 
-    /// Get the staked balance for a `(staker, asset)` pair.
-    pub fn get_balance(env: Env, staker: Address, asset: Symbol) -> i128 {
-        Self::balance_of(&env, &staker, &asset)
-    }
-
-    /// Configure the default APR and compounding mode used when a new yield
-    /// position is opened by the first [`Self::stake`] for a pair.
+    /// Get staking balance for an address.
     ///
     /// Existing positions are unaffected; change an open position's rate with
     /// [`Self::set_yield_rate`] instead.
     ///
     /// # Returns
-    /// The stored [`StakingConfig`].
-    pub fn set_yield_defaults(env: Env, apr: i128, mode: CompoundingMode) -> StakingConfig {
-        let config = StakingConfig {
-            default_apr: apr,
-            default_mode: mode,
-        };
-        env.storage()
-            .persistent()
-            .set(&StakeDataKey::Config, &config);
-        config
+    /// Current staking balance
+    pub fn get_balance(env: Env, staker: Address) -> i128 {
+        let key = YieldDataKey::Balance(staker);
+        env.storage().persistent().get(&key).unwrap_or(0)
     }
 
-    /// Set alert threshold for staking changes
+    /// Set alert threshold for staking changes.
+    ///
+    /// Only callable by the admin set during `initialize`.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
+    /// * `admin` - The admin address (must match the stored admin)
     /// * `threshold` - Alert threshold amount
     ///
     /// # Returns
     /// Success symbol if alert threshold is set
-    pub fn set_alert_threshold(_env: Env, _threshold: i128) -> Symbol {
+    pub fn set_alert_threshold(env: Env, admin: Address, threshold: i128) -> Symbol {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&YieldDataKey::Admin)
+            .expect("contract not initialized");
+        assert!(stored_admin == admin, "caller is not admin");
+        env.storage()
+            .persistent()
+            .set(&YieldDataKey::AlertThreshold, &threshold);
         symbol_short!("ok")
     }
 
