@@ -65,8 +65,8 @@ pub struct YieldRecord {
 
 /// A single immutable entry in a staker/asset yield history log.
 ///
-/// One entry is appended each time yield is checkpointed (accrued) or the rate
-/// changes, forming a complete, queryable audit trail.
+/// One entry is appended each time yield is checkpointed (accrued), the rate
+/// changes, or yield is claimed, forming a complete, queryable audit trail.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub struct YieldHistoryEntry {
@@ -78,8 +78,11 @@ pub struct YieldHistoryEntry {
     pub apr: i128,
     /// Yield earned during this period, base units.
     pub yield_earned: i128,
-    /// Cumulative yield after this entry, base units.
+    /// Cumulative unclaimed yield after this entry, base units.
     pub cumulative_yield: i128,
+    /// True when this is a zero-period marker recording a yield claim.
+    /// Claim markers have `yield_earned == 0` and `cumulative_yield == 0`.
+    pub is_claim: bool,
 }
 
 /// A projected future-earnings estimate for a position.
@@ -133,4 +136,29 @@ pub enum YieldDataKey {
     History(Address, Symbol),
     /// The [`DistributionSchedule`] list for a `(staker, asset)` pair.
     Schedule(Address, Symbol),
+}
+
+/// Default yield parameters applied when a position is first opened by a stake.
+///
+/// A single position, once opened, keeps its own APR and compounding mode across
+/// subsequent stakes/unstakes (which only adjust principal); these defaults seed
+/// brand-new positions and can be reconfigured before the first stake.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct StakingConfig {
+    /// APR seeded onto a newly opened yield position, fixed-point (see
+    /// [`crate::fixed_point::SCALE`]).
+    pub default_apr: i128,
+    /// Compounding mode seeded onto a newly opened yield position.
+    pub default_mode: CompoundingMode,
+}
+
+/// Storage keys for the staking layer that sits in front of the yield engine.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub enum StakeDataKey {
+    /// Staked balance (principal) for a `(staker, asset)` pair, base units.
+    Balance(Address, Symbol),
+    /// The default [`StakingConfig`] used when opening new positions.
+    Config,
 }

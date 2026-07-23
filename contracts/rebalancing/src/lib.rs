@@ -53,6 +53,25 @@ pub enum DataKey {
     Allocation(Symbol),
 }
 
+/// Event data for manual rebalance - includes drift summary via timestamp
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebalanceEventData {
+    pub portfolio_id: Symbol,
+    pub outcome: Symbol,
+    pub timestamp: u64,
+}
+
+/// Event data for scheduled rebalance - richer context for off-chain listeners
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SchedRebalanceEventData {
+    pub portfolio_id: Symbol,
+    pub outcome: Symbol,
+    pub timestamp: u64,
+    pub details: Symbol,
+}
+
 pub struct ScheduleValidator;
 
 impl ScheduleValidator {
@@ -114,7 +133,6 @@ impl RebalancingContract {
         symbol_short!("ok")
     }
 
-    /// Set a schedule for a portfolio
     pub fn set_schedule(env: Env, portfolio_id: Symbol, interval: RebalanceInterval) -> Symbol {
         if !ScheduleValidator::validate(&interval) {
             return symbol_short!("err_val");
@@ -123,22 +141,18 @@ impl RebalancingContract {
         if env.storage().persistent().has(&key) {
             return symbol_short!("err_exist");
         }
-        
         let now = env.ledger().timestamp();
         let next_execution = now + interval_to_seconds(&interval);
-        
         let schedule = RebalancingSchedule {
             portfolio_id,
             interval,
             next_execution,
             last_execution: 0,
         };
-        
         env.storage().persistent().set(&key, &schedule);
         symbol_short!("ok")
     }
 
-    /// Update schedule for a portfolio
     pub fn update_schedule(env: Env, portfolio_id: Symbol, interval: RebalanceInterval) -> Symbol {
         if !ScheduleValidator::validate(&interval) {
             return symbol_short!("err_val");
@@ -147,10 +161,8 @@ impl RebalancingContract {
         if !env.storage().persistent().has(&key) {
             return symbol_short!("err_none");
         }
-        
         let mut schedule: RebalancingSchedule = env.storage().persistent().get(&key).unwrap();
         let now = env.ledger().timestamp();
-        
         schedule.interval = interval;
         let interval_secs = interval_to_seconds(&schedule.interval);
         if schedule.last_execution > 0 {
@@ -158,12 +170,10 @@ impl RebalancingContract {
         } else {
             schedule.next_execution = now + interval_secs;
         }
-        
         env.storage().persistent().set(&key, &schedule);
         symbol_short!("ok")
     }
 
-    /// Cancel a schedule for a portfolio
     pub fn cancel_schedule(env: Env, portfolio_id: Symbol) -> Symbol {
         let key = DataKey::Schedule(portfolio_id.clone());
         if !env.storage().persistent().has(&key) {
@@ -173,7 +183,6 @@ impl RebalancingContract {
         symbol_short!("ok")
     }
 
-    /// Get schedule for a portfolio
     pub fn get_schedule(env: Env, portfolio_id: Symbol) -> Option<RebalancingSchedule> {
         let key = DataKey::Schedule(portfolio_id);
         env.storage().persistent().get(&key)
@@ -230,32 +239,38 @@ impl RebalancingContract {
     pub fn exec_scheduled_rebalance(env: Env, portfolio_id: Symbol) -> Symbol {
         let key = DataKey::Schedule(portfolio_id.clone());
         if !env.storage().persistent().has(&key) {
+            let ts = env.ledger().timestamp();
+            let event_data = SchedRebalanceEventData {
+                portfolio_id: portfolio_id.clone(),
+                outcome: symbol_short!("err_none"),
+                timestamp: ts,
+                details: symbol_short!("err_none"),
+            };
+            env.events().publish((symbol_short!("SREBAL"), portfolio_id.clone()), event_data);
             return symbol_short!("err_none");
         }
-        
         let mut schedule: RebalancingSchedule = env.storage().persistent().get(&key).unwrap();
         let now = env.ledger().timestamp();
-        
         if now < schedule.next_execution {
+            let event_data = SchedRebalanceEventData {
+                portfolio_id: portfolio_id.clone(),
+                outcome: symbol_short!("not_due"),
+                timestamp: now,
+                details: symbol_short!("not_due"),
+            };
+            env.events().publish((symbol_short!("SREBAL"), portfolio_id.clone()), event_data);
             return symbol_short!("not_due");
         }
-        
-        // Execute rebalance
         let outcome = Self::rebalance(env.clone(), portfolio_id.clone());
-        
-        // Update schedule
         schedule.last_execution = now;
         schedule.next_execution = now + interval_to_seconds(&schedule.interval);
         env.storage().persistent().set(&key, &schedule);
-        
-        // Log execution history
         let history_key = DataKey::History(portfolio_id.clone());
         let mut history: Vec<ExecutionHistoryRecord> = env
             .storage()
             .persistent()
             .get(&history_key)
             .unwrap_or_else(|| Vec::new(&env));
-            
         let record = ExecutionHistoryRecord {
             timestamp: now,
             outcome: outcome.clone(),
@@ -263,8 +278,24 @@ impl RebalancingContract {
         };
         history.push_back(record);
         env.storage().persistent().set(&history_key, &history);
-        
+        let sched_event = SchedRebalanceEventData {
+            portfolio_id: portfolio_id.clone(),
+            outcome: outcome.clone(),
+            timestamp: now,
+            details: symbol_short!("sched_ex"),
+        };
+        env.events().publish((symbol_short!("SREBAL"), portfolio_id.clone()), sched_event);
         outcome
+    }
+
+    pub fn check_and_exec_sched(env: Env, portfolio_id: Symbol) -> Symbol {
+        Self::check_exec_rebalance(env, portfolio_id)
+    }
+}
+
+impl RebalancingContract {
+    pub fn check_and_execute_scheduled_rebalance(env: Env, portfolio_id: Symbol) -> Symbol {
+        Self::check_exec_rebalance(env, portfolio_id)
     }
 }
 
@@ -284,7 +315,9 @@ mod tests {
     #[test]
     fn test_initialize() {
         let env = Env::default();
-        let result = RebalancingContract::initialize(env);
+        let contract_id = env.register_contract(None, RebalancingContract);
+        let client = RebalancingContractClient::new(&env, &contract_id);
+        let result = client.initialize();
         assert_eq!(result, symbol_short!("ok"));
     }
 

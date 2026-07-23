@@ -29,10 +29,17 @@ pub mod records;
 
 use crate::apy::APYCalculator;
 use crate::engine::YieldEngine;
+use crate::fixed_point::SCALE;
 use crate::projection::YieldProjector;
 use crate::records::{
-    CompoundingMode, DistributionSchedule, YieldHistoryEntry, YieldProjection, YieldRecord,
+    CompoundingMode, DistributionSchedule, StakeDataKey, StakingConfig, YieldHistoryEntry,
+    YieldProjection, YieldRecord,
 };
+
+/// Default APR seeded onto a newly opened yield position: 5% (fixed-point).
+const DEFAULT_APR: i128 = SCALE / 20;
+/// Default compounding mode seeded onto a newly opened yield position.
+const DEFAULT_MODE: CompoundingMode = CompoundingMode::Daily;
 
 /// Staking contract for AstraPort
 /// Manages staking operations, alert functionality, and yield calculation.
@@ -52,42 +59,96 @@ impl StakingContract {
         symbol_short!("ok")
     }
 
-    /// Stake assets into the contract
+    /// Stake `amount` of `asset` for `staker`, wiring the deposit into the yield
+    /// engine so the position's principal always equals the staked balance.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `staker` - Address of the staker
-    /// * `amount` - Amount to stake
+    /// If this is the first stake for the pair, a yield position is opened at the
+    /// configured default APR / compounding mode (see [`Self::set_yield_defaults`]).
+    /// If a position already exists, it is checkpointed (accrued to now) and its
+    /// principal raised to the new balance, preserving both its rate/mode and any
+    /// realized yield.
     ///
     /// # Returns
-    /// Success symbol if staking succeeds
-    pub fn stake(_env: Env, _staker: Symbol, _amount: i128) -> Symbol {
-        symbol_short!("done")
+    /// The staker's new staked balance for the asset.
+    pub fn stake(env: Env, staker: Address, asset: Symbol, amount: i128) -> i128 {
+        if amount <= 0 {
+            panic!("stake amount must be positive");
+        }
+        let new_balance = Self::balance_of(&env, &staker, &asset)
+            .checked_add(amount)
+            .expect("stake balance overflow");
+
+        let engine = YieldEngine::new(&env);
+        match engine.load_record(&staker, &asset) {
+            // Existing position: checkpoint, then raise principal (keeps its rate).
+            Some(_) => {
+                engine
+                    .set_principal(&staker, &asset, new_balance)
+                    .expect("failed to adjust yield principal on stake");
+            }
+            // First stake: open a position seeded with the default parameters.
+            None => {
+                let config = Self::load_config(&env);
+                engine
+                    .open_position(
+                        &staker,
+                        &asset,
+                        new_balance,
+                        config.default_apr,
+                        config.default_mode,
+                    )
+                    .expect("failed to open yield position on stake");
+            }
+        }
+
+        Self::set_balance(&env, &staker, &asset, new_balance);
+        new_balance
     }
 
-    /// Unstake assets from the contract
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `staker` - Address of the staker
-    /// * `amount` - Amount to unstake
+    /// Unstake `amount` of `asset` for `staker`, checkpointing accrued yield
+    /// before reducing the position's principal so no earned yield is lost.
     ///
     /// # Returns
-    /// Success symbol if unstaking succeeds
-    pub fn unstake(_env: Env, _staker: Symbol, _amount: i128) -> Symbol {
-        symbol_short!("done")
+    /// The staker's remaining staked balance for the asset.
+    pub fn unstake(env: Env, staker: Address, asset: Symbol, amount: i128) -> i128 {
+        let current = Self::balance_of(&env, &staker, &asset);
+        if amount <= 0 || amount > current {
+            panic!("invalid unstake amount");
+        }
+        let new_balance = current - amount;
+
+        // set_principal accrues (checkpoints) at the current rate *before* the
+        // principal drops, so realized yield is preserved.
+        YieldEngine::new(&env)
+            .set_principal(&staker, &asset, new_balance)
+            .expect("failed to adjust yield principal on unstake");
+
+        Self::set_balance(&env, &staker, &asset, new_balance);
+        new_balance
     }
 
-    /// Get staking balance for an address
+    /// Get the staked balance for a `(staker, asset)` pair.
+    pub fn get_balance(env: Env, staker: Address, asset: Symbol) -> i128 {
+        Self::balance_of(&env, &staker, &asset)
+    }
+
+    /// Configure the default APR and compounding mode used when a new yield
+    /// position is opened by the first [`Self::stake`] for a pair.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `staker` - Address of the staker
+    /// Existing positions are unaffected; change an open position's rate with
+    /// [`Self::set_yield_rate`] instead.
     ///
     /// # Returns
-    /// Current staking balance
-    pub fn get_balance(_env: Env, _staker: Symbol) -> i128 {
-        0
+    /// The stored [`StakingConfig`].
+    pub fn set_yield_defaults(env: Env, apr: i128, mode: CompoundingMode) -> StakingConfig {
+        let config = StakingConfig {
+            default_apr: apr,
+            default_mode: mode,
+        };
+        env.storage()
+            .persistent()
+            .set(&StakeDataKey::Config, &config);
+        config
     }
 
     /// Set alert threshold for staking changes
@@ -137,6 +198,25 @@ impl StakingContract {
         YieldEngine::new(&env)
             .accrue(&staker, &asset)
             .expect("failed to accrue yield")
+    }
+
+    /// Claim all yield accrued by a staker for an asset.
+    ///
+    /// The position is first checkpointed to the current ledger time. The full
+    /// checkpointed amount is returned, its unclaimed counter is reset to zero,
+    /// and a zero-period claim marker is appended to yield history.
+    pub fn claim_yield(env: Env, staker: Address, asset: Symbol) -> i128 {
+        staker.require_auth();
+
+        let engine = YieldEngine::new(&env);
+        let record = engine
+            .accrue(&staker, &asset)
+            .expect("failed to accrue yield before claim");
+        let claimed = engine.finalize_claim(record);
+
+        env.events()
+            .publish((symbol_short!("YLDCLAIM"), staker, asset), claimed);
+        claimed
     }
 
     /// The total yield a position has earned as of now (checkpointed plus
@@ -226,6 +306,37 @@ impl StakingContract {
     /// time, returning the total amount that became due.
     pub fn process_distribution(env: Env, staker: Address, asset: Symbol) -> i128 {
         YieldEngine::new(&env).process_distribution(&staker, &asset)
+    }
+}
+
+/// Internal helpers (not part of the contract's external interface).
+impl StakingContract {
+    /// Read the staked balance for a pair, defaulting to `0`.
+    fn balance_of(env: &Env, staker: &Address, asset: &Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StakeDataKey::Balance(staker.clone(), asset.clone()))
+            .unwrap_or(0)
+    }
+
+    /// Persist the staked balance for a pair.
+    fn set_balance(env: &Env, staker: &Address, asset: &Symbol, balance: i128) {
+        env.storage().persistent().set(
+            &StakeDataKey::Balance(staker.clone(), asset.clone()),
+            &balance,
+        );
+    }
+
+    /// Load the configured yield defaults, falling back to the built-in
+    /// [`DEFAULT_APR`] / [`DEFAULT_MODE`] when unset.
+    fn load_config(env: &Env) -> StakingConfig {
+        env.storage()
+            .persistent()
+            .get(&StakeDataKey::Config)
+            .unwrap_or(StakingConfig {
+                default_apr: DEFAULT_APR,
+                default_mode: DEFAULT_MODE,
+            })
     }
 }
 
