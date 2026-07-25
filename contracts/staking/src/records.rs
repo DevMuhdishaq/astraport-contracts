@@ -123,6 +123,28 @@ pub struct DistributionSchedule {
     pub executed: bool,
 }
 
+/// Describes the lock-up parameters for a staker's position.
+///
+/// When a staker creates a locked stake, this record is written to
+/// [`StakeDataKey::LockPosition`]. It is used by the emergency-unstake system to
+/// compute how much of the lock has elapsed and derive the applicable penalty.
+///
+/// A position with `unlock_ts == 0` is treated as unlocked (no lock-up penalty
+/// applies).
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct LockPosition {
+    /// The staker who owns this lock.
+    pub staker: Address,
+    /// Ledger timestamp (seconds) when the lock period started.
+    pub lock_start_ts: u64,
+    /// Ledger timestamp (seconds) when the lock expires and normal unstaking
+    /// is allowed without penalty.
+    pub unlock_ts: u64,
+    /// Total principal locked, in base units.
+    pub locked_amount: i128,
+}
+
 /// Storage keys for the yield engine's persistent data.
 ///
 /// Keeping keys in a single enum avoids stringly-typed lookups and keeps the
@@ -160,22 +182,17 @@ pub struct StakingConfig {
 }
 
 /// Storage keys for the staking layer that sits in front of the yield engine.
+///
+/// Note: `Balance` is keyed by staker address only (not by asset). The current
+/// contract manages a single aggregate balance per staker. If per-asset balances
+/// are needed in the future, the key should be extended to `Balance(Address, Symbol)`.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub enum StakeDataKey {
-    /// Staked balance (principal) for a `(staker, asset)` pair, base units.
-    Balance(Address, Symbol),
+    /// The current staked balance for a staker address, in base units.
+    Balance(Address),
     /// The default [`StakingConfig`] used when opening new positions.
     Config,
-}
-
-/// Storage keys for the staking balance data.
-///
-/// Keeping keys in a single enum avoids stringly-typed lookups and keeps the
-/// storage layout easy to audit.
-#[contracttype]
-#[derive(Debug, Clone)]
-pub enum StakeDataKey {
-    /// The current staking balance for a staker address.
-    Balance(Address),
+    /// The [`LockPosition`] for a staker address, if any.
+    LockPosition(Address),
 }
