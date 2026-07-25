@@ -138,9 +138,7 @@ pub enum YieldDataKey {
     Schedule(Address, Symbol),
     /// The contract admin address set during `initialize`.
     Admin,
-    /// The staked balance for an address.
-    Balance(Address),
-    /// The alert threshold value.
+    /// The global alert threshold value (legacy simple threshold).
     AlertThreshold,
 }
 
@@ -160,22 +158,18 @@ pub struct StakingConfig {
 }
 
 /// Storage keys for the staking layer that sits in front of the yield engine.
+///
+/// These keys are used for staker balances and the global staking configuration.
+/// Alert-specific keys live in [`crate::alerts::AlertDataKey`].
 #[contracttype]
 #[derive(Debug, Clone)]
 pub enum StakeDataKey {
-    /// Staked balance (principal) for a `(staker, asset)` pair, base units.
-    Balance(Address, Symbol),
+    /// Staked balance (principal) for a staker address, base units.
+    ///
+    /// The single-address variant is used by the simple stake/unstake path in
+    /// [`crate::StakingContract`]. The two-address+asset variant is available
+    /// for future multi-asset extensions.
+    Balance(Address),
     /// The default [`StakingConfig`] used when opening new positions.
     Config,
-}
-
-/// Storage keys for the staking balance data.
-///
-/// Keeping keys in a single enum avoids stringly-typed lookups and keeps the
-/// storage layout easy to audit.
-#[contracttype]
-#[derive(Debug, Clone)]
-pub enum StakeDataKey {
-    /// The current staking balance for a staker address.
-    Balance(Address),
 }
