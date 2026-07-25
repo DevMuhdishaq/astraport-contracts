@@ -1,4 +1,7 @@
 #![no_std]
+
+mod multi_asset_rebalancer;
+
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Env, Map, Symbol, Vec};
 
 /// Default tolerance used when deciding whether a holding needs rebalancing.
@@ -17,6 +20,8 @@ pub enum RebalancingError {
     TargetAllocationNotFound = 3,
     /// No current holdings have been supplied for this portfolio.
     CurrentHoldingsNotFound = 4,
+    /// An error occurred during multi-asset rebalancing.
+    MultiAssetRebalanceFailed = 5,
 }
 
 #[contracttype]
@@ -404,8 +409,36 @@ impl RebalancingContract {
         outcome
     }
 
+    pub fn get_rebalance_plan(
+        env: Env,
+        portfolio_id: Symbol,
+    ) -> Result<RebalanceResult, RebalancingError> {
+        Self::calculate_rebalance(&env, &portfolio_id)
+    }
+
     pub fn check_and_exec_sched(env: Env, portfolio_id: Symbol) -> Symbol {
         Self::check_exec_sched_rebalance(env, portfolio_id)
+    }
+
+    pub fn execute_rebalance(
+        env: Env,
+        portfolio_id: Symbol,
+        strategy: multi_asset_rebalancer::ExecutionStrategy,
+    ) -> Result<(), RebalancingError> {
+        let rebalancer_id = env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
+        let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
+        client.rebalance(&portfolio_id, &strategy);
+        Ok(())
+    }
+
+    pub fn simulate_rebalance(
+        env: Env,
+        portfolio_id: Symbol,
+        strategy: multi_asset_rebalancer::ExecutionStrategy,
+    ) -> Result<multi_asset_rebalancer::SimulationResult, RebalancingError> {
+        let rebalancer_id = env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
+        let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
+        Ok(client.simulate_rebalance(&portfolio_id, &strategy))
     }
 }
 
