@@ -9,8 +9,8 @@
 //!
 //! - [`fixed_point`] — deterministic fixed-point math (`mul`, `div`, `pow`,
 //!   `exp`, `ln`) used in place of floating point.
-//! - [`compounding`] — the [`compounding::CompoundingStrategy`] trait with
-//!   `Daily` and `Continuous` variants, plus the [`compounding::YieldCalculator`].
+//! - [`compounding`] — [`compounding::CompoundingStrategy`] trait with `Daily`
+//!   and `Continuous` variants, plus [`compounding::YieldCalculator`].
 //! - [`apy`] — [`apy::APYCalculator`] for accurate APR ⇄ APY conversion.
 //! - [`records`] — Soroban-typed storage structs and key enums:
 //!   [`records::YieldRecord`], [`records::YieldHistoryEntry`],
@@ -29,14 +29,17 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
 
+pub mod alerts;
 pub mod apy;
 pub mod compounding;
 pub mod emergency;
 pub mod engine;
 pub mod fixed_point;
+pub mod multi_asset;
 pub mod projection;
 pub mod records;
 
+use crate::alerts::{AlertConfig, AlertHistoryEntry, AlertMonitor, AlertThreshold};
 use crate::apy::APYCalculator;
 use crate::emergency::{
     EmergencyDataKey, EmergencyUnstakeConfig, EmergencyUnstakeExecutor, EmergencyUnstakeQuery,
@@ -44,6 +47,7 @@ use crate::emergency::{
 };
 use crate::engine::YieldEngine;
 use crate::fixed_point::SCALE;
+use crate::multi_asset::MultiAssetStaking;
 use crate::projection::YieldProjector;
 use crate::records::{
     CompoundingMode, DistributionSchedule, LockPosition, StakeDataKey, StakingConfig,
@@ -91,6 +95,7 @@ pub enum Error {
 #[derive(Debug, Clone)]
 pub struct StakeEvent {
     pub staker: Address,
+    pub asset: Symbol,
     pub amount: i128,
     pub new_balance: i128,
 }
@@ -100,6 +105,7 @@ pub struct StakeEvent {
 #[derive(Debug, Clone)]
 pub struct UnstakeEvent {
     pub staker: Address,
+    pub asset: Symbol,
     pub amount: i128,
     pub new_balance: i128,
 }
@@ -155,11 +161,12 @@ impl StakingContract {
             (symbol_short!("stake"), staker.clone()),
             StakeEvent {
                 staker,
+                asset,
                 amount,
                 new_balance,
             },
         );
-        Ok(symbol_short!("done"))
+        Ok(new_balance)
     }
 
     /// Unstake assets from the contract (normal, after lock expiry).
@@ -191,11 +198,20 @@ impl StakingContract {
             (symbol_short!("unstake"), staker.clone()),
             UnstakeEvent {
                 staker,
+                asset,
                 amount,
-                new_balance,
+                new_balance: remaining,
             },
         );
-        Ok(symbol_short!("done"))
+        Ok(remaining)
+    }
+
+    /// Return the staked balance for a `(staker, asset)` pair.
+    pub fn get_balance(env: Env, staker: Address, asset: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StakeDataKey::Balance(staker, asset))
+            .unwrap_or(0)
     }
 
     /// Get the staked balance for an address.
@@ -494,13 +510,11 @@ impl StakingContract {
     /// Claim all yield accrued by a staker for an asset.
     pub fn claim_yield(env: Env, staker: Address, asset: Symbol) -> i128 {
         staker.require_auth();
-
         let engine = YieldEngine::new(&env);
         let record = engine
             .accrue(&staker, &asset)
             .expect("failed to accrue yield before claim");
         let claimed = engine.finalize_claim(record);
-
         env.events()
             .publish((symbol_short!("YLDCLAIM"), staker, asset), claimed);
         claimed
@@ -550,6 +564,10 @@ impl StakingContract {
     pub fn apy_to_apr(_env: Env, apy: i128, mode: CompoundingMode) -> i128 {
         APYCalculator::apy_to_apr(apy, mode.to_strategy()).expect("apy_to_apr failed")
     }
+
+    // -----------------------------------------------------------------------
+    // Distribution scheduling
+    // -----------------------------------------------------------------------
 
     /// Schedule a yield distribution to a staker.
     pub fn schedule_distribution(
@@ -610,7 +628,26 @@ impl StakingContract {
             .unwrap_or(StakingConfig {
                 default_apr: DEFAULT_APR,
                 default_mode: DEFAULT_MODE,
-            })
+            });
+
+        AssetYieldRate {
+            asset: asset.clone(),
+            apr: global.default_apr,
+            mode: global.default_mode,
+            min_stake: 0,
+            max_stake: 0,
+            unlock_schedule: UnlockSchedule::Immediate,
+        }
+    }
+
+    /// Panic if `caller` is not the stored admin.
+    fn assert_admin(env: &Env, caller: &Address) {
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&YieldDataKey::Admin)
+            .expect("contract not initialized");
+        assert!(stored == *caller, "caller is not admin");
     }
 }
 

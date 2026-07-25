@@ -5,7 +5,7 @@
 //! pure-math results from [`crate::compounding`] and [`crate::apy`] into durable,
 //! queryable structures keyed by staker and asset.
 
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 /// The compounding model, mirrored as a `#[contracttype]` for storage.
 ///
@@ -38,6 +38,10 @@ impl CompoundingMode {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Core yield records
+// ---------------------------------------------------------------------------
 
 /// A staker's active yield-accruing position for a single asset.
 ///
@@ -160,8 +164,6 @@ pub enum YieldDataKey {
     Schedule(Address, Symbol),
     /// The contract admin address set during `initialize`.
     Admin,
-    /// The staked balance for an address.
-    Balance(Address),
     /// The alert threshold value.
     AlertThreshold,
 }
