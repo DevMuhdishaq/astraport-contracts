@@ -1,42 +1,64 @@
 #![no_std]
 //! # AstraPort Staking Contract
 //!
-//! Manages asset staking together with an accurate, compounding **yield
-//! calculation engine**. The yield engine is organized into focused modules:
+//! Manages **multi-asset staking** with heterogeneous yield rates, independent
+//! lock-up periods, graduated unlock schedules, and aggregate portfolio yield
+//! calculations.
+//!
+//! The contract is organised into focused modules:
 //!
 //! - [`fixed_point`] — deterministic fixed-point math (`mul`, `div`, `pow`,
 //!   `exp`, `ln`) used in place of floating point.
-//! - [`compounding`] — the [`compounding::CompoundingStrategy`] trait with
-//!   `Daily` and `Continuous` variants, plus the [`compounding::YieldCalculator`].
+//! - [`compounding`] — [`compounding::CompoundingStrategy`] trait with `Daily`
+//!   and `Continuous` variants, plus [`compounding::YieldCalculator`].
 //! - [`apy`] — [`apy::APYCalculator`] for accurate APR ⇄ APY conversion.
-//! - [`records`] — Soroban-typed [`records::YieldRecord`],
-//!   [`records::YieldHistoryEntry`], [`records::YieldProjection`], and
-//!   [`records::DistributionSchedule`].
-//! - [`engine`] — the storage-backed [`engine::YieldEngine`] that performs
-//!   real-time accrual, time-weighted rate changes, history logging, and
-//!   distribution scheduling.
+//! - [`records`] — Soroban-typed structs and storage key enums, including the
+//!   new [`records::StakingPosition`], [`records::AssetYieldRate`],
+//!   [`records::UnlockSchedule`], and [`records::PortfolioSnapshot`].
+//! - [`engine`] — storage-backed [`engine::YieldEngine`] for real-time accrual,
+//!   time-weighted rate changes, history logging, and distribution scheduling.
 //! - [`projection`] — [`projection::YieldProjector`] for future-earnings
 //!   estimates.
+//! - [`multi_asset`] — [`multi_asset::MultiAssetStaking`] facade that wraps the
+//!   yield engine with per-asset configuration, unlock-schedule enforcement,
+//!   and portfolio aggregation.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
 
 pub mod apy;
 pub mod compounding;
 pub mod engine;
 pub mod fixed_point;
+pub mod multi_asset;
 pub mod projection;
 pub mod records;
 
 use crate::apy::APYCalculator;
 use crate::engine::YieldEngine;
 use crate::fixed_point::SCALE;
+use crate::multi_asset::MultiAssetStaking;
 use crate::projection::YieldProjector;
 use crate::records::{
-    CompoundingMode, DistributionSchedule, StakeDataKey, YieldHistoryEntry, YieldProjection,
-    YieldRecord,
+    AssetYieldRate, CompoundingMode, DistributionSchedule, PortfolioSnapshot, StakeDataKey,
+    StakingConfig, StakingPosition, UnlockSchedule, YieldDataKey, YieldHistoryEntry,
+    YieldProjection, YieldRecord,
 };
+
+// ---------------------------------------------------------------------------
+// Default yield parameters (used when no per-asset config is set)
+// ---------------------------------------------------------------------------
+
+/// Default APR: 5 % (0.05 × SCALE).
+const DEFAULT_APR: i128 = SCALE / 20;
+
+/// Default compounding mode.
+const DEFAULT_MODE: CompoundingMode = CompoundingMode::Daily;
+
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
 
 /// Errors returned by the staking contract.
 #[contracterror]
@@ -47,43 +69,60 @@ pub enum Error {
     InvalidStakeAmount = 1,
     /// Insufficient balance: cannot unstake more than currently staked.
     InsufficientBalance = 2,
+    /// The requested amount is below the asset's configured minimum stake.
+    BelowMinimumStake = 3,
+    /// The resulting position would exceed the asset's configured maximum stake.
+    ExceedsMaximumStake = 4,
+    /// The position is still within its lock-up period.
+    PositionLocked = 5,
+    /// The requested withdrawal exceeds the amount that has unlocked so far.
+    ExceedsUnlockedAmount = 6,
 }
 
-/// Event emitted when assets are staked
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/// Event emitted when assets are staked.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub struct StakeEvent {
     pub staker: Address,
+    pub asset: Symbol,
     pub amount: i128,
     pub new_balance: i128,
 }
 
-/// Event emitted when assets are unstaked
+/// Event emitted when assets are unstaked.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub struct UnstakeEvent {
     pub staker: Address,
+    pub asset: Symbol,
     pub amount: i128,
     pub new_balance: i128,
 }
 
-/// Staking contract for AstraPort
-/// Manages staking operations, alert functionality, and yield calculation.
+// ---------------------------------------------------------------------------
+// Contract
+// ---------------------------------------------------------------------------
+
+/// Staking contract for AstraPort — multi-asset edition.
+///
+/// Manages staking operations for 10+ asset types simultaneously, each with
+/// independent yield rates, lock-up terms, and withdrawal restrictions.
 #[contract]
 pub struct StakingContract;
 
 #[contractimpl]
 impl StakingContract {
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
     /// Initialize the staking contract with an admin.
     ///
-    /// Can only be called once; subsequent calls will panic.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `admin` - The admin address to store
-    ///
-    /// # Returns
-    /// Success symbol if initialization succeeds
+    /// Can only be called once; subsequent calls panic.
     pub fn initialize(env: Env, admin: Address) -> Symbol {
         let storage = env.storage().persistent();
         if storage.has(&YieldDataKey::Admin) {
@@ -93,130 +132,199 @@ impl StakingContract {
         symbol_short!("ok")
     }
 
-    /// Stake assets into the contract.
+    // -----------------------------------------------------------------------
+    // Multi-asset staking — primary interface
+    // -----------------------------------------------------------------------
+
+    /// Stake `amount` of `asset` on behalf of `staker`.
     ///
-    /// Requires authorization from the staker.
-    ///
-    /// If this is the first stake for the pair, a yield position is opened at the
-    /// configured default APR / compounding mode (see [`Self::set_yield_defaults`]).
-    /// If a position already exists, it is checkpointed (accrued to now) and its
-    /// principal raised to the new balance, preserving both its rate/mode and any
-    /// realized yield.
+    /// Requires authorization from `staker`. The call:
+    /// 1. Validates the amount against the asset's `min_stake` / `max_stake`.
+    /// 2. Opens or updates a [`StakingPosition`] for the `(staker, asset)` pair.
+    /// 3. Synchronises the principal in the underlying [`YieldEngine`], preserving
+    ///    any previously accrued yield.
+    /// 4. Tracks the asset in the staker's asset list for portfolio queries.
     ///
     /// # Returns
-    /// Success symbol if staking succeeds
-    pub fn stake(env: Env, staker: Address, amount: i128) -> Result<Symbol, Error> {
+    /// The new staked balance for this `(staker, asset)` pair.
+    pub fn stake(env: Env, staker: Address, asset: Symbol, amount: i128) -> Result<i128, Error> {
+        staker.require_auth();
         if amount <= 0 {
             return Err(Error::InvalidStakeAmount);
         }
-        // Get current balance
-        let key = StakeDataKey::Balance(staker.clone());
-        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current_balance + amount;
-        // Persist new balance
-        env.storage().persistent().set(&key, &new_balance);
-        // Publish event
+
+        let config = Self::load_asset_config(&env, &asset);
+        if config.min_stake > 0 && amount < config.min_stake {
+            return Err(Error::BelowMinimumStake);
+        }
+
+        let mas = MultiAssetStaking::new(&env);
+        let new_balance = mas.stake(&staker, &asset, amount, &config)?;
+
         env.events().publish(
             (symbol_short!("stake"), staker.clone()),
             StakeEvent {
                 staker,
+                asset,
                 amount,
                 new_balance,
             },
         );
-        Ok(symbol_short!("done"))
+        Ok(new_balance)
     }
 
-    /// Unstake assets from the contract.
+    /// Unstake `amount` of `asset` on behalf of `staker`.
     ///
-    /// Requires authorization from the staker.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `staker` - Address of the staker
-    /// * `amount` - Amount to unstake
+    /// Requires authorization from `staker`. The call:
+    /// 1. Checks the staker has sufficient balance.
+    /// 2. Validates the requested amount against the position's unlock schedule.
+    /// 3. Checkpoints accrued yield before reducing the principal.
+    /// 4. Removes the position (and the asset from the staker's list) when the
+    ///    remaining balance reaches zero.
     ///
     /// # Returns
-    /// Success symbol if unstaking succeeds
-    pub fn unstake(env: Env, staker: Address, amount: i128) -> Result<Symbol, Error> {
+    /// The remaining staked balance for this `(staker, asset)` pair.
+    pub fn unstake(env: Env, staker: Address, asset: Symbol, amount: i128) -> Result<i128, Error> {
+        staker.require_auth();
         if amount <= 0 {
             return Err(Error::InvalidStakeAmount);
         }
-        // Get current balance
-        let key = StakeDataKey::Balance(staker.clone());
-        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if amount > current_balance {
-            return Err(Error::InsufficientBalance);
-        }
-        let new_balance = current_balance - amount;
-        // Persist new balance
-        if new_balance == 0 {
-            env.storage().persistent().remove(&key);
-        } else {
-            env.storage().persistent().set(&key, &new_balance);
-        }
-        // Publish event
+
+        let mas = MultiAssetStaking::new(&env);
+        let remaining = mas.unstake(&staker, &asset, amount)?;
+
         env.events().publish(
             (symbol_short!("unstake"), staker.clone()),
             UnstakeEvent {
                 staker,
+                asset,
                 amount,
-                new_balance,
+                new_balance: remaining,
             },
         );
-        Ok(symbol_short!("done"))
+        Ok(remaining)
     }
 
-    /// Get staking balance for an address.
-    ///
-    /// Existing positions are unaffected; change an open position's rate with
-    /// [`Self::set_yield_rate`] instead.
-    ///
-    /// # Returns
-    /// Current staking balance
-    pub fn get_balance(env: Env, staker: Address) -> i128 {
-        let key = StakeDataKey::Balance(staker);
-        env.storage().persistent().get(&key).unwrap_or(0)
+    /// Return the staked balance for a `(staker, asset)` pair.
+    pub fn get_balance(env: Env, staker: Address, asset: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StakeDataKey::Balance(staker, asset))
+            .unwrap_or(0)
     }
 
-    /// Set alert threshold for staking changes.
+    /// Return the full [`StakingPosition`] for a `(staker, asset)` pair, or
+    /// `None` if no position exists.
+    pub fn get_position(env: Env, staker: Address, asset: Symbol) -> Option<StakingPosition> {
+        MultiAssetStaking::new(&env).load_position(&staker, &asset)
+    }
+
+    // -----------------------------------------------------------------------
+    // Portfolio
+    // -----------------------------------------------------------------------
+
+    /// Return a [`PortfolioSnapshot`] aggregating all active positions for
+    /// `staker`.
     ///
-    /// Only callable by the admin set during `initialize`.
+    /// This is a **read-only** call — it does not mutate any storage.
+    pub fn get_portfolio(env: Env, staker: Address) -> PortfolioSnapshot {
+        MultiAssetStaking::new(&env).portfolio_snapshot(&staker)
+    }
+
+    /// Return the total accrued yield across all assets for `staker` as of
+    /// the current ledger time.
+    ///
+    /// This is a **read-only** call.
+    pub fn portfolio_yield(env: Env, staker: Address) -> i128 {
+        MultiAssetStaking::new(&env).portfolio_yield(&staker)
+    }
+
+    /// Return the list of asset symbols the staker currently has positions in.
+    pub fn staker_assets(env: Env, staker: Address) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&StakeDataKey::StakerAssets(staker))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // -----------------------------------------------------------------------
+    // Asset configuration
+    // -----------------------------------------------------------------------
+
+    /// Configure (or reconfigure) the yield parameters for an `asset`.
+    ///
+    /// Only callable by the admin. Setting a per-asset config overrides the
+    /// global defaults for all *new* positions of that asset. Existing
+    /// positions keep their current APR until [`Self::set_yield_rate`] is
+    /// called on them individually.
     ///
     /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `admin` - The admin address (must match the stored admin)
-    /// * `threshold` - Alert threshold amount
+    /// * `asset`           — asset symbol to configure.
+    /// * `apr`             — annual rate, fixed-point.
+    /// * `mode`            — compounding model.
+    /// * `min_stake`       — minimum stake per position (0 = no minimum).
+    /// * `max_stake`       — maximum stake per position (0 = no maximum).
+    /// * `unlock_schedule` — lock-up / vesting schedule for new positions.
+    pub fn configure_asset(
+        env: Env,
+        admin: Address,
+        asset: Symbol,
+        apr: i128,
+        mode: CompoundingMode,
+        min_stake: i128,
+        max_stake: i128,
+        unlock_schedule: UnlockSchedule,
+    ) -> Symbol {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+
+        let cfg = AssetYieldRate {
+            asset: asset.clone(),
+            apr,
+            mode,
+            min_stake,
+            max_stake,
+            unlock_schedule,
+        };
+        env.storage()
+            .persistent()
+            .set(&StakeDataKey::AssetConfig(asset), &cfg);
+        symbol_short!("ok")
+    }
+
+    /// Set the global default yield parameters applied when no per-asset
+    /// configuration exists.
     ///
-    /// # Returns
-    /// Success symbol if alert threshold is set
+    /// Only callable by the admin (or during tests without auth mocking).
+    pub fn set_yield_defaults(env: Env, default_apr: i128, mode: CompoundingMode) -> Symbol {
+        env.storage().persistent().set(
+            &StakeDataKey::Config,
+            &StakingConfig {
+                default_apr,
+                default_mode: mode,
+            },
+        );
+        symbol_short!("ok")
+    }
+
+    /// Set the alert threshold.  Admin-only.
     pub fn set_alert_threshold(env: Env, admin: Address, threshold: i128) -> Symbol {
         admin.require_auth();
-        let stored_admin: Address = env
-            .storage()
-            .persistent()
-            .get(&YieldDataKey::Admin)
-            .expect("contract not initialized");
-        assert!(stored_admin == admin, "caller is not admin");
+        Self::assert_admin(&env, &admin);
         env.storage()
             .persistent()
             .set(&YieldDataKey::AlertThreshold, &threshold);
         symbol_short!("ok")
     }
 
-    // ---------------------------------------------------------------------
-    // Yield calculation engine entrypoints
-    // ---------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Yield engine — per-position interface
+    // -----------------------------------------------------------------------
 
     /// Open (or reset) a yield-accruing position for a staker and asset.
     ///
-    /// Starts accruing yield from the current ledger time at the given `apr`
-    /// (fixed-point, e.g. `50_000_000_000_000_000` for 5%) under the chosen
-    /// compounding `mode`. If a position already exists it is checkpointed and
-    /// its accrued yield preserved.
-    ///
-    /// # Returns
-    /// The active [`YieldRecord`].
+    /// Starts accruing yield from the current ledger time. If a position
+    /// already exists it is checkpointed and its accrued yield preserved.
     pub fn open_yield_position(
         env: Env,
         staker: Address,
@@ -232,20 +340,16 @@ impl StakingContract {
 
     /// Checkpoint a position, realizing all yield accrued up to the current
     /// ledger time and recording a history entry.
-    ///
-    /// # Returns
-    /// The updated [`YieldRecord`].
     pub fn accrue_yield(env: Env, staker: Address, asset: Symbol) -> YieldRecord {
         YieldEngine::new(&env)
             .accrue(&staker, &asset)
             .expect("failed to accrue yield")
     }
 
-    /// Claim all yield accrued by a staker for an asset.
+    /// Claim all yield accrued by `staker` for `asset`.
     ///
-    /// The position is first checkpointed to the current ledger time. The full
-    /// checkpointed amount is returned, its unclaimed counter is reset to zero,
-    /// and a zero-period claim marker is appended to yield history.
+    /// The position is checkpointed first. The full checkpointed amount is
+    /// returned and the position's unclaimed counter is reset to zero.
     pub fn claim_yield(env: Env, staker: Address, asset: Symbol) -> i128 {
         staker.require_auth();
 
@@ -268,19 +372,15 @@ impl StakingContract {
             .expect("failed to read current yield")
     }
 
-    /// Change the APR for a position, checkpointing prior yield at the old rate
-    /// first so the transition is time-weighted and exact.
-    ///
-    /// # Returns
-    /// The updated [`YieldRecord`] carrying the new rate.
+    /// Change the APR for a position, checkpointing prior yield at the old
+    /// rate first so the transition is time-weighted and exact.
     pub fn set_yield_rate(env: Env, staker: Address, asset: Symbol, new_apr: i128) -> YieldRecord {
         YieldEngine::new(&env)
             .set_rate(&staker, &asset, new_apr)
             .expect("failed to set yield rate")
     }
 
-    /// The complete, queryable yield history for a staker/asset pair, oldest
-    /// entry first.
+    /// The complete yield history for a staker/asset pair, oldest entry first.
     pub fn yield_history(
         env: Env,
         staker: Address,
@@ -289,13 +389,13 @@ impl StakingContract {
         YieldEngine::new(&env).history(&staker, &asset)
     }
 
+    // -----------------------------------------------------------------------
+    // Projections / APY (pure — no storage mutations)
+    // -----------------------------------------------------------------------
+
     /// Project future earnings for a set of position parameters over a horizon.
     ///
-    /// This is a pure calculation — it does not require an existing position and
-    /// does not touch storage — so it can be used to preview any scenario.
-    ///
-    /// # Arguments
-    /// * `horizon_seconds` - How far into the future to project.
+    /// Does not require an existing position and does not touch storage.
     pub fn project_yield(
         _env: Env,
         principal: i128,
@@ -319,13 +419,14 @@ impl StakingContract {
         APYCalculator::apy_to_apr(apy, mode.to_strategy()).expect("apy_to_apr failed")
     }
 
+    // -----------------------------------------------------------------------
+    // Distribution scheduling
+    // -----------------------------------------------------------------------
+
     /// Schedule a yield distribution to a staker.
     ///
     /// `interval_seconds` of 0 schedules a one-off distribution; a positive
     /// interval makes it recurring.
-    ///
-    /// # Returns
-    /// The created [`DistributionSchedule`].
     pub fn schedule_distribution(
         env: Env,
         staker: Address,
@@ -350,34 +451,51 @@ impl StakingContract {
     }
 }
 
-/// Internal helpers (not part of the contract's external interface).
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
 impl StakingContract {
-    /// Read the staked balance for a pair, defaulting to `0`.
-    fn balance_of(env: &Env, staker: &Address, asset: &Symbol) -> i128 {
-        env.storage()
+    /// Load the per-asset [`AssetYieldRate`], falling back to the global
+    /// [`StakingConfig`] defaults when no asset-specific config exists.
+    fn load_asset_config(env: &Env, asset: &Symbol) -> AssetYieldRate {
+        // Per-asset config takes priority.
+        if let Some(cfg) = env
+            .storage()
             .persistent()
-            .get(&StakeDataKey::Balance(staker.clone(), asset.clone()))
-            .unwrap_or(0)
-    }
+            .get::<StakeDataKey, AssetYieldRate>(&StakeDataKey::AssetConfig(asset.clone()))
+        {
+            return cfg;
+        }
 
-    /// Persist the staked balance for a pair.
-    fn set_balance(env: &Env, staker: &Address, asset: &Symbol, balance: i128) {
-        env.storage().persistent().set(
-            &StakeDataKey::Balance(staker.clone(), asset.clone()),
-            &balance,
-        );
-    }
-
-    /// Load the configured yield defaults, falling back to the built-in
-    /// [`DEFAULT_APR`] / [`DEFAULT_MODE`] when unset.
-    fn load_config(env: &Env) -> StakingConfig {
-        env.storage()
+        // Fall back to the global staking defaults.
+        let global: StakingConfig = env
+            .storage()
             .persistent()
             .get(&StakeDataKey::Config)
             .unwrap_or(StakingConfig {
                 default_apr: DEFAULT_APR,
                 default_mode: DEFAULT_MODE,
-            })
+            });
+
+        AssetYieldRate {
+            asset: asset.clone(),
+            apr: global.default_apr,
+            mode: global.default_mode,
+            min_stake: 0,
+            max_stake: 0,
+            unlock_schedule: UnlockSchedule::Immediate,
+        }
+    }
+
+    /// Panic if `caller` is not the stored admin.
+    fn assert_admin(env: &Env, caller: &Address) {
+        let stored: Address = env
+            .storage()
+            .persistent()
+            .get(&YieldDataKey::Admin)
+            .expect("contract not initialized");
+        assert!(stored == *caller, "caller is not admin");
     }
 }
 
