@@ -127,116 +127,27 @@ pub struct DistributionSchedule {
     pub executed: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Multi-asset staking types
-// ---------------------------------------------------------------------------
-
-/// The unlock schedule variant controlling when a staked position can be
-/// withdrawn.
+/// Describes the lock-up parameters for a staker's position.
 ///
-/// - `Immediate`: No lock-up; the staker may withdraw at any time.
-/// - `Cliff`: The full principal is locked until `unlock_ts`; after that the
-///   entire position can be withdrawn.
-/// - `Graduated`: The principal unlocks in equal tranches of `tranche_pct`
-///   (basis points, 1 = 0.01%) every `interval_seconds` seconds, starting
-///   at `start_ts`. Any remainder unlocks in the final tranche.
-#[contracttype]
-#[derive(Debug, Clone)]
-pub enum UnlockSchedule {
-    /// No lock-up.
-    Immediate,
-    /// Entire position unlocks at `unlock_ts` (ledger timestamp, seconds).
-    Cliff(u64),
-    /// Tranched unlock starting at `start_ts`, advancing every
-    /// `interval_seconds` by `tranche_pct` basis points (1/10000).
-    Graduated(GraduatedUnlock),
-}
-
-/// Parameters for a graduated (tranche-based) unlock schedule.
-#[contracttype]
-#[derive(Debug, Clone)]
-pub struct GraduatedUnlock {
-    /// Ledger timestamp (seconds) at which the first tranche unlocks.
-    pub start_ts: u64,
-    /// Seconds between consecutive tranches.
-    pub interval_seconds: u64,
-    /// Percentage of principal that unlocks per tranche, in basis points
-    /// (1 bp = 0.01%).  For example, 1000 = 10% per tranche.
-    pub tranche_pct_bps: u32,
-}
-
-/// Asset-specific yield configuration, independent per asset.
+/// When a staker creates a locked stake, this record is written to
+/// [`StakeDataKey::LockPosition`]. It is used by the emergency-unstake system to
+/// compute how much of the lock has elapsed and derive the applicable penalty.
 ///
-/// `min_stake` prevents dust positions; `max_stake` caps individual exposure.
-/// Both values are in the asset's base units; `0` means no limit.
+/// A position with `unlock_ts == 0` is treated as unlocked (no lock-up penalty
+/// applies).
 #[contracttype]
 #[derive(Debug, Clone)]
-pub struct AssetYieldRate {
-    /// Asset this configuration applies to.
-    pub asset: Symbol,
-    /// Annual percentage rate for this asset, fixed-point.
-    pub apr: i128,
-    /// Compounding model for this asset.
-    pub mode: CompoundingMode,
-    /// Minimum stake required to open a position (0 = no minimum).
-    pub min_stake: i128,
-    /// Maximum stake allowed per staker (0 = no maximum).
-    pub max_stake: i128,
-    /// Unlock schedule applied to new positions for this asset.
-    pub unlock_schedule: UnlockSchedule,
-}
-
-/// A staking position for a single `(staker, asset)` pair.
-///
-/// This is the authoritative source of truth for multi-asset staking. It
-/// combines the staked principal with its asset-specific yield parameters,
-/// lock-up state, and the snapshot of accrued yield so it can be queried
-/// independently from the [`YieldRecord`] used by the lower-level engine.
-#[contracttype]
-#[derive(Debug, Clone)]
-pub struct StakingPosition {
-    /// Staker who owns this position.
+pub struct LockPosition {
+    /// The staker who owns this lock.
     pub staker: Address,
-    /// Asset staked in this position.
-    pub asset: Symbol,
-    /// Principal currently locked in this position, base units.
-    pub principal: i128,
-    /// APR in effect for this position, fixed-point.
-    pub apr: i128,
-    /// Compounding model for this position.
-    pub mode: CompoundingMode,
-    /// Ledger timestamp (seconds) at which the position was first opened.
-    pub opened_at: u64,
-    /// Unlock schedule for this position.
-    pub unlock_schedule: UnlockSchedule,
-    /// Cached accrued yield (updated on each checkpoint), base units.
-    pub accrued_yield: i128,
+    /// Ledger timestamp (seconds) when the lock period started.
+    pub lock_start_ts: u64,
+    /// Ledger timestamp (seconds) when the lock expires and normal unstaking
+    /// is allowed without penalty.
+    pub unlock_ts: u64,
+    /// Total principal locked, in base units.
+    pub locked_amount: i128,
 }
-
-/// A point-in-time snapshot of an entire portfolio's staking state.
-///
-/// Returned by `get_portfolio` and `portfolio_yield`; it aggregates across all
-/// active positions for a staker.
-#[contracttype]
-#[derive(Debug, Clone)]
-pub struct PortfolioSnapshot {
-    /// Total principal staked across all assets, summed in their base units.
-    /// (Heterogeneous assets are summed as raw `i128`; callers should apply
-    /// USD or reference-price conversion for meaningful comparison.)
-    pub total_principal: i128,
-    /// Total accrued yield across all assets, base units (same caveat as above).
-    pub total_accrued_yield: i128,
-    /// Number of distinct assets held in the portfolio.
-    pub asset_count: u32,
-    /// Weighted-average APR across all positions (weighted by principal), fixed-point.
-    pub weighted_avg_apr: i128,
-    /// All active positions at the time of the snapshot.
-    pub positions: Vec<StakingPosition>,
-}
-
-// ---------------------------------------------------------------------------
-// Storage key enums
-// ---------------------------------------------------------------------------
 
 /// Storage keys for the yield engine's persistent data.
 ///
@@ -273,17 +184,17 @@ pub struct StakingConfig {
 }
 
 /// Storage keys for the staking layer that sits in front of the yield engine.
+///
+/// Note: `Balance` is keyed by staker address only (not by asset). The current
+/// contract manages a single aggregate balance per staker. If per-asset balances
+/// are needed in the future, the key should be extended to `Balance(Address, Symbol)`.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub enum StakeDataKey {
-    /// Staked balance (principal) for a `(staker, asset)` pair, base units.
-    Balance(Address, Symbol),
+    /// The current staked balance for a staker address, in base units.
+    Balance(Address),
     /// The default [`StakingConfig`] used when opening new positions.
     Config,
-    /// Per-asset yield configuration [`AssetYieldRate`].
-    AssetConfig(Symbol),
-    /// The full [`StakingPosition`] for a `(staker, asset)` pair.
-    Position(Address, Symbol),
-    /// The list of asset [`Symbol`]s a staker currently has positions in.
-    StakerAssets(Address),
+    /// The [`LockPosition`] for a staker address, if any.
+    LockPosition(Address),
 }

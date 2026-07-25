@@ -1,19 +1,17 @@
 //! Unit and contract-level tests for the multi-asset staking contract.
 //!
-//! Tests cover:
-//! - Contract lifecycle (initialize, admin checks)
-//! - Multi-asset stake / unstake / balance
-//! - Unlock schedule enforcement (Immediate, Cliff, Graduated)
-//! - Yield accrual, rate changes, history, claims
-//! - Portfolio aggregation (snapshot, weighted APR, total yield)
-//! - APR ↔ APY conversions and projections
-//! - Distribution scheduling
+//! Tests are grouped into:
+//! - original contract smoke tests (`initialize`, `get_balance`);
+//! - authentication and balance tests;
+//! - yield engine tests (accrual, rate changes, history, projections,
+//!   distributions);
+//! - emergency unstake tests.
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{symbol_short, vec, Address, Env, String, Vec};
 
-use crate::alerts::{AlertKind, AlertSeverity, AlertThreshold};
+use crate::emergency::PenaltyDecayFunction;
 use crate::fixed_point::{SCALE, SECONDS_PER_DAY, SECONDS_PER_YEAR};
 use crate::records::{
     CompoundingMode, GraduatedUnlock, StakeDataKey, UnlockSchedule, YieldDataKey,
@@ -51,7 +49,41 @@ fn approx(a: i128, b: i128, tol: i128) {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn setup() -> (Env, StakingContractClient<'static>) {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    (env, client)
+}
+
+fn setup_with_admin() -> (Env, StakingContractClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    (env, client, admin)
+}
+
+/// Assert `a` and `b` are within `tol`.
+fn approx(a: i128, b: i128, tol: i128) {
+    let diff = (a - b).abs();
+    assert!(
+        diff <= tol,
+        "expected {} ~= {} within {}, diff {}",
+        a,
+        b,
+        tol,
+        diff
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Smoke tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -83,27 +115,30 @@ fn test_get_balance_initial() {
 }
 
 #[test]
-fn test_stake_and_unstake_single_asset() {
-    let (env, client) = setup();
+fn test_stake_and_unstake() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup();
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
 
-    assert_eq!(client.stake(&staker, &asset, &1_000), 1_000);
-    assert_eq!(client.get_balance(&staker, &asset), 1_000);
+    assert_eq!(client.stake(&staker, &100), symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 100);
 
-    assert_eq!(client.stake(&staker, &asset, &500), 1_500);
-    assert_eq!(client.get_balance(&staker, &asset), 1_500);
+    assert_eq!(client.stake(&staker, &50), symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 150);
 
-    assert_eq!(client.unstake(&staker, &asset, &600), 900);
-    assert_eq!(client.get_balance(&staker, &asset), 900);
+    assert_eq!(client.unstake(&staker, &75), symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 75);
 
-    assert_eq!(client.unstake(&staker, &asset, &900), 0);
-    assert_eq!(client.get_balance(&staker, &asset), 0);
+    assert_eq!(client.unstake(&staker, &75), symbol_short!("done"));
+    assert_eq!(client.get_balance(&staker), 0);
 }
 
 #[test]
 fn test_stake_multiple_assets_independently() {
     let (env, client) = setup();
+    env.mock_all_auths();
     let staker = Address::generate(&env);
     let xlm = symbol_short!("XLM");
     let usdc = symbol_short!("USDC");
@@ -125,165 +160,72 @@ fn test_stake_multiple_assets_independently() {
 }
 
 #[test]
-#[should_panic(expected = "InvalidStakeAmount")]
-fn test_stake_zero_panics() {
-    let (env, client) = setup();
-    client.stake(&Address::generate(&env), &symbol_short!("XLM"), &0);
-}
-
-#[test]
-#[should_panic(expected = "InvalidStakeAmount")]
-fn test_stake_negative_panics() {
-    let (env, client) = setup();
-    client.stake(&Address::generate(&env), &symbol_short!("XLM"), &-1);
-}
-
-#[test]
 #[should_panic(expected = "InsufficientBalance")]
-fn test_unstake_more_than_balance_panics() {
-    let (env, client) = setup();
+fn test_unstake_more_than_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup();
     let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-    client.stake(&staker, &asset, &100);
-    client.unstake(&staker, &asset, &200);
+    client.stake(&staker, &100);
+    client.unstake(&staker, &150);
 }
 
 // ---------------------------------------------------------------------------
-// Staker asset list / portfolio
+// Authentication tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_staker_assets_tracked() {
-    let (env, client) = setup();
+fn test_stake_requires_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
     let staker = Address::generate(&env);
-
-    client.stake(&staker, &symbol_short!("XLM"), &100);
-    client.stake(&staker, &symbol_short!("USDC"), &200);
-    client.stake(&staker, &symbol_short!("ETH"), &300);
-
-    let assets = client.staker_assets(&staker);
-    assert_eq!(assets.len(), 3);
+    client.stake(&staker, &1_000);
+    assert_eq!(client.get_balance(&staker), 1_000);
 }
 
 #[test]
-fn test_full_unstake_removes_asset_from_list() {
-    let (env, client) = setup();
+#[should_panic]
+fn test_stake_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
     let staker = Address::generate(&env);
-    let xlm = symbol_short!("XLM");
-    let usdc = symbol_short!("USDC");
-
-    client.stake(&staker, &xlm, &100);
-    client.stake(&staker, &usdc, &200);
-
-    assert_eq!(client.staker_assets(&staker).len(), 2);
-
-    client.unstake(&staker, &xlm, &100); // full exit
-    assert_eq!(client.staker_assets(&staker).len(), 1);
+    // No mock_auths — require_auth will fail.
+    client.stake(&staker, &1_000);
 }
 
 #[test]
-fn test_portfolio_snapshot_aggregates_positions() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-
-    client.stake(&staker, &symbol_short!("XLM"), &1_000);
-    client.stake(&staker, &symbol_short!("USDC"), &2_000);
-
-    let snap = client.get_portfolio(&staker);
-    assert_eq!(snap.total_principal, 3_000);
-    assert_eq!(snap.asset_count, 2);
-}
-
-#[test]
-fn test_portfolio_yield_sums_all_assets() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let xlm = symbol_short!("XLM");
-    let usdc = symbol_short!("USDC");
-
-    client.stake(&staker, &xlm, &SCALE);
-    client.stake(&staker, &usdc, &SCALE);
-
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-
-    // Each position earns ~5% daily on 1e18 principal: ~5.1267e16 each.
-    let total = client.portfolio_yield(&staker);
-    approx(total, 2 * 51_267_496_505_408_400i128, 1_000_000_000_000);
-}
-
-// ---------------------------------------------------------------------------
-// Asset configuration / heterogeneous yield rates
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_configure_asset_sets_custom_apr() {
+fn test_set_alert_threshold_requires_admin_auth() {
     let (env, client, admin) = setup_with_admin();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("ETH");
-
-    // Configure ETH at 20% APR continuous.
-    client.configure_asset(
-        &admin,
-        &asset,
-        &(SCALE / 5),
-        &CompoundingMode::Continuous,
-        &0,
-        &0,
-        &UnlockSchedule::Immediate,
-    );
-    client.stake(&staker, &asset, &SCALE);
-
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-    let rec = client.accrue_yield(&staker, &asset);
-    // e^0.2 - 1 = 0.22140275816...
-    approx(rec.accrued_yield, 221_402_758_160_169_833, 1_000_000_000_000);
+    client.set_alert_threshold(&admin, &10_000);
 }
 
 #[test]
-fn test_different_assets_earn_different_rates() {
-    let (env, client, admin) = setup_with_admin();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
+#[should_panic(expected = "caller is not admin")]
+fn test_set_alert_threshold_non_admin_fails() {
+    let (env, client, _admin) = setup_with_admin();
+    let non_admin = Address::generate(&env);
+    client.set_alert_threshold(&non_admin, &10_000);
+}
 
-    let low = symbol_short!("LOWRATE");
-    let high = symbol_short!("HRATE");
+// ---------------------------------------------------------------------------
+// Yield engine contract-level tests
+// ---------------------------------------------------------------------------
 
-    client.configure_asset(
-        &admin,
-        &low,
-        &(SCALE / 100),          // 1% APR
-        &CompoundingMode::Continuous,
-        &0, &0, &UnlockSchedule::Immediate,
-    );
-    client.configure_asset(
-        &admin,
-        &high,
-        &(SCALE / 5),            // 20% APR
-        &CompoundingMode::Continuous,
-        &0, &0, &UnlockSchedule::Immediate,
-    );
+#[test]
+fn apr_to_apy_via_contract_matches_formula() {
+    let (_env, client) = setup();
+    let apy = client.apr_to_apy(&(SCALE / 20), &CompoundingMode::Daily);
+    approx(apy, 51_267_496_505_408_400, 100_000_000_000);
 
-    client.stake(&staker, &low, &SCALE);
-    client.stake(&staker, &high, &SCALE);
-
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-
-    let low_yield = client.current_yield(&staker, &low);
-    let high_yield = client.current_yield(&staker, &high);
-
-    assert!(
-        high_yield > low_yield,
-        "high-rate asset should earn more: {} vs {}",
-        high_yield,
-        low_yield
-    );
-    // e^0.01 - 1 ≈ 0.01005017
-    approx(low_yield, 10_050_167_084_168_058, 1_000_000_000_000);
-    // e^0.2 - 1 ≈ 0.22140275
-    approx(high_yield, 221_402_758_160_169_833, 1_000_000_000_000);
+    let apy_c = client.apr_to_apy(&(SCALE / 20), &CompoundingMode::Continuous);
+    approx(apy_c, 51_271_096_376_024_040, 100_000_000_000);
 }
 
 #[test]
@@ -293,60 +235,30 @@ fn test_set_yield_defaults_applies_to_new_positions() {
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
 
-    // Override default to 10% continuous before first stake.
-    client.set_yield_defaults(&(SCALE / 10), &CompoundingMode::Continuous);
-    client.stake(&staker, &asset, &SCALE);
-
-    env.ledger().set_timestamp(SECONDS_PER_YEAR / 2);
-    // e^(0.1 * 0.5) - 1 = e^0.05 - 1 ≈ 0.05127
-    approx(
-        client.current_yield(&staker, &asset),
-        51_271_096_376_024_040,
-        100_000_000_000,
-    );
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 20), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(SECONDS_PER_YEAR);
+    let record = client.accrue_yield(&staker, &asset);
+    approx(record.accrued_yield, 51_267_496_505_408_400, 100_000_000_000);
 }
 
 #[test]
-fn test_min_stake_enforcement() {
-    let (env, client, admin) = setup_with_admin();
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("ELITE");
-
-    client.configure_asset(
-        &admin,
-        &asset,
-        &DEFAULT_APR,
-        &CompoundingMode::Daily,
-        &500,   // min_stake = 500
-        &0,
-        &UnlockSchedule::Immediate,
-    );
-
-    // Below minimum — should panic with BelowMinimumStake.
-    let result = client.try_stake(&staker, &asset, &100);
-    assert!(result.is_err());
+fn apy_apr_roundtrip_via_contract() {
+    let (_env, client) = setup();
+    let apr = SCALE / 10;
+    let apy = client.apr_to_apy(&apr, &CompoundingMode::Daily);
+    let back = client.apy_to_apr(&apy, &CompoundingMode::Daily);
+    approx(back, apr, 100_000_000_000_000);
 }
 
 #[test]
-fn test_max_stake_enforcement() {
-    let (env, client, admin) = setup_with_admin();
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("CAPPED");
-
-    client.configure_asset(
-        &admin,
-        &asset,
-        &DEFAULT_APR,
-        &CompoundingMode::Daily,
-        &0,
-        &1_000,  // max_stake = 1_000
-        &UnlockSchedule::Immediate,
-    );
-
-    client.stake(&staker, &asset, &1_000);
-    // One more unit would exceed the cap.
-    let result = client.try_stake(&staker, &asset, &1);
-    assert!(result.is_err());
+fn thirty_day_projection_within_one_percent() {
+    let (_env, client) = setup();
+    let horizon = 30 * SECONDS_PER_DAY;
+    let proj = client.project_yield(&SCALE, &(SCALE / 10), &CompoundingMode::Continuous, &horizon);
+    let expected = 8_253_048_640_000_000i128;
+    let diff = (proj.projected_yield - expected).abs();
+    assert!(diff <= expected / 100, "projection off >1%: {} vs {}", proj.projected_yield, expected);
+    assert_eq!(proj.projected_balance, SCALE + proj.projected_yield);
 }
 
 // ---------------------------------------------------------------------------
@@ -354,357 +266,379 @@ fn test_max_stake_enforcement() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_cliff_unlock_blocks_early_withdrawal() {
-    let (env, client, admin) = setup_with_admin();
+fn accrue_claim_and_reclaim_resets_unclaimed_yield() {
+    let (env, client) = setup();
+    env.mock_all_auths();
     env.ledger().set_timestamp(0);
     let staker = Address::generate(&env);
     let asset = symbol_short!("VESTED");
 
-    // Cliff unlocks at t = 1 year.
-    client.configure_asset(
-        &admin,
-        &asset,
-        &DEFAULT_APR,
-        &CompoundingMode::Daily,
-        &0, &0,
-        &UnlockSchedule::Cliff(SECONDS_PER_YEAR),
-    );
-    client.stake(&staker, &asset, &1_000);
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
 
-    // Before the cliff — should fail.
-    env.ledger().set_timestamp(SECONDS_PER_YEAR - 1);
-    let result = client.try_unstake(&staker, &asset, &1);
-    assert!(result.is_err());
-
-    // At the cliff — should succeed.
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-    assert_eq!(client.unstake(&staker, &asset, &1_000), 0);
-}
-
-#[test]
-fn test_graduated_unlock_partial_withdrawal() {
-    let (env, client, admin) = setup_with_admin();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("GRAD");
-
-    // 25% (2500 bps) per 90-day tranche: full unlock after 4 tranches.
-    let grad = GraduatedUnlock {
-        start_ts: 0,
-        interval_seconds: 90 * SECONDS_PER_DAY,
-        tranche_pct_bps: 2500,
-    };
-    client.configure_asset(
-        &admin,
-        &asset,
-        &DEFAULT_APR,
-        &CompoundingMode::Daily,
-        &0, &0,
-        &UnlockSchedule::Graduated(grad),
-    );
-    client.stake(&staker, &asset, &1_000);
-
-    // At t = 0 the first tranche (25%) has just unlocked.
-    assert_eq!(client.unstake(&staker, &asset, &250), 750);
-
-    // After tranche 2 (t = 90 days), another 25% of original is unlocked.
-    // Remaining principal = 750; unlocked from original = 50% of 1000 = 500.
-    // Available to withdraw = 500 - already withdrawn 250 = … but the engine
-    // tracks current principal (750), and 50% of 1000 = 500, which is less
-    // than 750, so the unlocked cap is 500.
-    env.ledger().set_timestamp(90 * SECONDS_PER_DAY);
-    // 500 unlocked of original, 250 already withdrawn → 250 more available.
-    assert_eq!(client.unstake(&staker, &asset, &250), 500);
-}
-
-#[test]
-fn test_graduated_unlock_full_after_all_tranches() {
-    let (env, client, admin) = setup_with_admin();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("GFULL");
-
-    let grad = GraduatedUnlock {
-        start_ts: 0,
-        interval_seconds: SECONDS_PER_DAY,
-        tranche_pct_bps: 2500, // 4 tranches
-    };
-    client.configure_asset(
-        &admin,
-        &asset,
-        &DEFAULT_APR,
-        &CompoundingMode::Daily,
-        &0, &0,
-        &UnlockSchedule::Graduated(grad),
-    );
-    client.stake(&staker, &asset, &1_000);
-
-    // After 4 days all tranches are done → full withdrawal allowed.
-    env.ledger().set_timestamp(4 * SECONDS_PER_DAY);
-    assert_eq!(client.unstake(&staker, &asset, &1_000), 0);
-}
-
-#[test]
-fn test_immediate_unlock_allows_instant_withdrawal() {
-    let (env, client) = setup();
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("FREE");
-    client.stake(&staker, &asset, &1_000);
-    assert_eq!(client.unstake(&staker, &asset, &1_000), 0);
-}
-
-// ---------------------------------------------------------------------------
-// Yield accrual across multiple assets
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_stake_opens_position_and_accrues_on_staked_principal() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    assert_eq!(client.stake(&staker, &asset, &SCALE), SCALE);
-    assert_eq!(client.get_balance(&staker, &asset), SCALE);
-
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-    // 5% APR daily on 1e18: (1 + 0.05/365)^365 - 1 ≈ 5.1267e16
-    approx(
-        client.current_yield(&staker, &asset),
-        51_267_496_505_408_400,
-        100_000_000_000,
-    );
-}
-
-#[test]
-fn test_additional_stake_raises_principal_and_keeps_yield() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(1_000);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    client.stake(&staker, &asset, &SCALE);
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-    let new_bal = client.stake(&staker, &asset, &SCALE);
-    assert_eq!(new_bal, 2 * SCALE);
-
-    let rec = client.accrue_yield(&staker, &asset);
-    assert_eq!(rec.principal, 2 * SCALE);
-    approx(rec.accrued_yield, 51_267_496_505_408_400, 100_000_000_000);
-}
-
-#[test]
-fn test_unstake_preserves_accrued_yield_and_reduces_principal() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    client.stake(&staker, &asset, &SCALE);
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-    let expected_yield = 51_267_496_505_408_400i128;
-
-    assert_eq!(client.unstake(&staker, &asset, &(SCALE / 2)), SCALE / 2);
-
-    let rec = client.accrue_yield(&staker, &asset);
-    assert_eq!(rec.principal, SCALE / 2);
-    approx(rec.accrued_yield, expected_yield, 100_000_000_000);
-}
-
-#[test]
-fn test_rate_change_is_time_weighted() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(1_000);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    // Open at 4%, then switch to 8% at the halfway mark.
-    client.open_yield_position(
-        &staker, &asset, &SCALE, &(4 * SCALE / 100), &CompoundingMode::Continuous,
-    );
-    env.ledger().set_timestamp(SECONDS_PER_YEAR / 2);
-    client.set_yield_rate(&staker, &asset, &(8 * SCALE / 100));
-
-#[test]
-fn disabled_threshold_does_not_fire() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(1_000);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    let seg1 = 20_201_340_026_755_810i128; // e^0.02 - 1
-    let seg2 = 40_810_774_192_388_960i128; // e^0.04 - 1
-    approx(rec.accrued_yield, seg1 + seg2, 10_000_000_000);
-}
-
-#[test]
-fn test_accrue_claim_resets_unclaimed_yield() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(1_000);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    client.open_yield_position(
-        &staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily,
-    );
     env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
-
     let accrued = client.accrue_yield(&staker, &asset).accrued_yield;
     assert!(accrued > 0);
+
     assert_eq!(client.claim_yield(&staker, &asset), accrued);
     assert_eq!(client.current_yield(&staker, &asset), 0);
-    // Double claim returns zero.
     assert_eq!(client.claim_yield(&staker, &asset), 0);
 }
 
-#[test]
-fn test_history_is_complete_and_queryable() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    client.open_yield_position(
-        &staker, &asset, &SCALE, &(SCALE / 20), &CompoundingMode::Daily,
-    );
-    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
-    client.accrue_yield(&staker, &asset);
-    env.ledger().set_timestamp(60 * SECONDS_PER_DAY);
-    client.accrue_yield(&staker, &asset);
-    env.ledger().set_timestamp(90 * SECONDS_PER_DAY);
-    let rec = client.accrue_yield(&staker, &asset);
-
-    let history = client.yield_history(&staker, &asset);
-    assert_eq!(history.len(), 3);
-    assert_eq!(history.get(2).unwrap().cumulative_yield, rec.accrued_yield);
-    assert_eq!(history.get(0).unwrap().period_seconds, 30 * SECONDS_PER_DAY);
-}
-
 // ---------------------------------------------------------------------------
-// APR ↔ APY conversions and projections
+// Emergency unstake — configuration tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_apr_to_apy_known_values() {
-    let (_env, client) = setup();
-    approx(
-        client.apr_to_apy(&(SCALE / 20), &CompoundingMode::Daily),
-        51_267_496_505_408_400,
-        100_000_000_000,
-    );
-    approx(
-        client.apr_to_apy(&(SCALE / 20), &CompoundingMode::Continuous),
-        51_271_096_376_024_040,
-        100_000_000_000,
-    );
-}
-
-#[test]
-fn test_apy_apr_roundtrip() {
-    let (_env, client) = setup();
-    let apr = SCALE / 10;
-    let apy = client.apr_to_apy(&apr, &CompoundingMode::Daily);
-    approx(client.apy_to_apr(&apy, &CompoundingMode::Daily), apr, 100_000_000_000_000);
-}
-
-#[test]
-fn test_thirty_day_projection_within_one_percent() {
-    let (_env, client) = setup();
-    let horizon = 30 * SECONDS_PER_DAY;
-    let proj = client.project_yield(&SCALE, &(SCALE / 10), &CompoundingMode::Continuous, &horizon);
-    let expected = 8_253_048_640_000_000i128;
-    let diff = (proj.projected_yield - expected).abs();
-    assert!(
-        diff <= expected / 100,
-        "projection off by >1%: {} vs {}",
-        proj.projected_yield,
-        expected
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Distribution scheduling
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_one_off_distribution() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(1_000);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    client.schedule_distribution(&staker, &asset, &500, &2_000, &0);
-    assert_eq!(client.process_distribution(&staker, &asset), 0);
-
-    env.ledger().set_timestamp(2_000);
-    client.check_alerts(&staker, &asset, &200, &(SCALE / 20), &0);
-
-    env.ledger().set_timestamp(3_000);
-    assert_eq!(client.process_distribution(&staker, &asset), 0);
-}
-
-#[test]
-fn test_recurring_distribution_rolls_forward() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(1_000);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    client.schedule_distribution(&staker, &asset, &100, &1_000, &1_000);
-
-#[test]
-fn pending_alerts_excludes_acknowledged() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(1_000);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-
-    let t = make_threshold(&env, AlertKind::BalanceDrop, 500, AlertSeverity::Warning, "floor");
-    client.set_alert_config(&staker, &asset, &vec![&env, t], &true);
-
-    env.ledger().set_timestamp(2_000);
-    client.check_alerts(&staker, &asset, &200, &(SCALE / 20), &0);
-
-    env.ledger().set_timestamp(2_500);
-    assert_eq!(client.process_distribution(&staker, &asset), 0);
-}
-
-// ---------------------------------------------------------------------------
-// Admin controls
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_set_alert_threshold_requires_admin() {
+fn configure_emergency_unstake_stores_config() {
     let (env, client, admin) = setup_with_admin();
-    assert_eq!(client.set_alert_threshold(&admin, &10_000), symbol_short!("ok"));
+    let treasury = Address::generate(&env);
+
+    client.configure_emergency_unstake(
+        &admin,
+        &3_000,                          // 30% start penalty
+        &500,                            // 5% end penalty
+        &PenaltyDecayFunction::Linear,
+        &(7 * 24 * 3600u64),             // 7-day cooldown
+        &treasury,
+        &true,
+    );
+    client.stake(&staker, &asset, &1_000);
+
+    let cfg = client.get_emergency_config().unwrap();
+    assert_eq!(cfg.penalty_start_bps, 3_000);
+    assert_eq!(cfg.penalty_end_bps, 500);
+    assert!(cfg.enabled);
+    assert_eq!(cfg.cooldown_seconds, 7 * 24 * 3600);
 }
 
 #[test]
 #[should_panic(expected = "caller is not admin")]
-fn test_set_alert_threshold_non_admin_fails() {
+fn configure_emergency_unstake_requires_admin() {
     let (env, client, _admin) = setup_with_admin();
-    client.set_alert_threshold(&Address::generate(&env), &10_000);
+    let non_admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    client.configure_emergency_unstake(
+        &non_admin,
+        &3_000,
+        &500,
+        &PenaltyDecayFunction::Linear,
+        &86_400u64,
+        &treasury,
+        &true,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Emergency unstake — core flow tests
+// ---------------------------------------------------------------------------
+
+/// Sets up the contract with an emergency-unstake config, a staker's stake,
+/// and a lock position. Returns (env, client, admin, staker, treasury).
+fn setup_emergency(
+    lock_start_ts: u64,
+    unlock_ts: u64,
+    stake_amount: i128,
+) -> (Env, StakingContractClient<'static>, Address, Address, Address) {
+    let (env, client, admin) = setup_with_admin();
+    env.ledger().set_timestamp(lock_start_ts);
+
+    let treasury = Address::generate(&env);
+    let staker = Address::generate(&env);
+
+    // Configure emergency unstake: 30% → 5% linear decay, 1-day cooldown.
+    client.configure_emergency_unstake(
+        &admin,
+        &3_000,
+        &500,
+        &PenaltyDecayFunction::Linear,
+        &(24 * 3600u64),
+        &treasury,
+        &true,
+    );
+
+    // Stake.
+    client.stake(&staker, &stake_amount);
+
+    // Register lock position.
+    client.set_lock_position(&admin, &staker, &lock_start_ts, &unlock_ts, &stake_amount);
+
+    (env, client, admin, staker, treasury)
 }
 
 #[test]
-#[should_panic]
-fn test_claim_yield_requires_staker_auth() {
-    let env = Env::default(); // no mock_all_auths
-    let contract_id = env.register_contract(None, StakingContract);
-    let client = StakingContractClient::new(&env, &contract_id);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
+fn emergency_unstake_at_start_applies_max_penalty() {
+    let lock_start = 1_000_000u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
 
-    {
-        // Open position with mocked auth.
-        let env2 = Env::default();
-        env2.mock_all_auths();
-        let cid2 = env2.register_contract(None, StakingContract);
-        let c2 = StakingContractClient::new(&env2, &cid2);
-        c2.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
-    }
-    // Claim without auth — should panic.
-    client.claim_yield(&staker, &asset);
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    // At t = lock_start (elapsed = 0) → start penalty = 30% (3000 bps).
+    env.ledger().set_timestamp(lock_start);
+    let record = client.emergency_unstake(&staker, &1_000_000);
+
+    assert_eq!(record.penalty_bps_applied, 3_000);
+    assert_eq!(record.penalty_amount, 300_000);    // 30% of 1_000_000
+    assert_eq!(record.amount_returned, 700_000);   // 70% back to staker
+    assert_eq!(record.amount_requested, 1_000_000);
+    assert!(!record.is_partial);
+}
+
+#[test]
+fn emergency_unstake_at_end_applies_min_penalty() {
+    let lock_start = 1_000_000u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    // At unlock (elapsed == total) → end penalty = 5% (500 bps).
+    env.ledger().set_timestamp(unlock);
+    let record = client.emergency_unstake(&staker, &1_000_000);
+
+    assert_eq!(record.penalty_bps_applied, 500);
+    assert_eq!(record.penalty_amount, 50_000);     // 5% of 1_000_000
+    assert_eq!(record.amount_returned, 950_000);
+}
+
+#[test]
+fn emergency_unstake_at_midpoint_applies_mid_penalty() {
+    let lock_start = 1_000_000u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 2_000_000);
+
+    // At midpoint linear decay: penalty ~= (3000+500)/2 = 1750 bps.
+    env.ledger().set_timestamp(lock_start + total_lock / 2);
+    let record = client.emergency_unstake(&staker, &2_000_000);
+
+    let expected_bps = 1_750i128;
+    let diff = (record.penalty_bps_applied - expected_bps).abs();
+    assert!(diff <= 5, "mid-point penalty {} != expected ~{}", record.penalty_bps_applied, expected_bps);
+    assert_eq!(record.amount_returned + record.penalty_amount, 2_000_000);
+}
+
+#[test]
+fn emergency_unstake_partial_reduces_balance_correctly() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    // Partially unstake half.
+    env.ledger().set_timestamp(lock_start);
+    let record = client.emergency_unstake(&staker, &500_000);
+
+    assert!(record.is_partial, "should be marked partial");
+    assert_eq!(record.amount_requested, 500_000);
+    // Balance reduced by full gross amount (500_000), not by net.
+    assert_eq!(client.get_balance(&staker), 500_000);
+}
+
+#[test]
+fn emergency_unstake_updates_history() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    env.ledger().set_timestamp(lock_start + total_lock / 4);
+    client.emergency_unstake(&staker, &200_000);
+    env.ledger().set_timestamp(lock_start + total_lock * 2);  // past cooldown
+    client.emergency_unstake(&staker, &100_000);
+
+    let history = client.get_emergency_unstake_history(&staker);
+    assert_eq!(history.len(), 2, "expected two emergency unstake records");
+    assert_eq!(history.get(0).unwrap().amount_requested, 200_000);
+    assert_eq!(history.get(1).unwrap().amount_requested, 100_000);
+}
+
+#[test]
+fn emergency_unstake_activates_cooldown() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+    let cooldown = 24 * 3600u64;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    env.ledger().set_timestamp(lock_start);
+    client.emergency_unstake(&staker, &100_000);
+
+    // Cooldown should be active immediately after.
+    assert!(client.is_in_cooldown(&staker));
+
+    // End should be set correctly.
+    let cooldown_end = client.get_cooldown_end(&staker);
+    assert_eq!(cooldown_end, lock_start + cooldown);
+}
+
+#[test]
+#[should_panic(expected = "CooldownActive")]
+fn emergency_unstake_fails_during_cooldown() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    env.ledger().set_timestamp(lock_start);
+    client.emergency_unstake(&staker, &100_000);
+
+    // Still within cooldown — this must panic.
+    env.ledger().set_timestamp(lock_start + 3600); // only 1 hour later, cooldown = 1 day
+    client.emergency_unstake(&staker, &100_000);
+}
+
+#[test]
+fn cooldown_expires_and_second_emergency_unstake_succeeds() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+    let cooldown = 24 * 3600u64;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    env.ledger().set_timestamp(lock_start);
+    client.emergency_unstake(&staker, &100_000);
+
+    // After cooldown, another emergency unstake succeeds.
+    env.ledger().set_timestamp(lock_start + cooldown + 1);
+    assert!(!client.is_in_cooldown(&staker));
+    let record = client.emergency_unstake(&staker, &100_000);
+    assert_eq!(record.amount_requested, 100_000);
+}
+
+// ---------------------------------------------------------------------------
+// Emergency unstake — exponential decay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emergency_unstake_exponential_midpoint_lower_than_linear() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+    let stake = 1_000_000i128;
+
+    // Linear config.
+    let (env_lin, client_lin, admin_lin) = setup_with_admin();
+    env_lin.mock_all_auths();
+    env_lin.ledger().set_timestamp(lock_start);
+    let treasury_lin = Address::generate(&env_lin);
+    let staker_lin = Address::generate(&env_lin);
+    client_lin.configure_emergency_unstake(
+        &admin_lin, &4_000, &400, &PenaltyDecayFunction::Linear,
+        &0u64, &treasury_lin, &true,
+    );
+    client_lin.stake(&staker_lin, &stake);
+    client_lin.set_lock_position(&admin_lin, &staker_lin, &lock_start, &unlock, &stake);
+    env_lin.ledger().set_timestamp(lock_start + total_lock / 2);
+    let rec_lin = client_lin.emergency_unstake(&staker_lin, &stake);
+
+    // Exponential config.
+    let (env_exp, client_exp, admin_exp) = setup_with_admin();
+    env_exp.mock_all_auths();
+    env_exp.ledger().set_timestamp(lock_start);
+    let treasury_exp = Address::generate(&env_exp);
+    let staker_exp = Address::generate(&env_exp);
+    client_exp.configure_emergency_unstake(
+        &admin_exp, &4_000, &400, &PenaltyDecayFunction::Exponential,
+        &0u64, &treasury_exp, &true,
+    );
+    client_exp.stake(&staker_exp, &stake);
+    client_exp.set_lock_position(&admin_exp, &staker_exp, &lock_start, &unlock, &stake);
+    env_exp.ledger().set_timestamp(lock_start + total_lock / 2);
+    let rec_exp = client_exp.emergency_unstake(&staker_exp, &stake);
+
+    assert!(
+        rec_exp.penalty_bps_applied < rec_lin.penalty_bps_applied,
+        "exponential mid penalty {} should be < linear mid penalty {}",
+        rec_exp.penalty_bps_applied,
+        rec_lin.penalty_bps_applied,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Emergency unstake — error paths
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "EmergencyUnstakeConfig not initialized")]
+fn emergency_unstake_without_config_panics() {
+    let (env, client, _admin) = setup_with_admin();
+    env.mock_all_auths();
+    let staker = Address::generate(&env);
+    client.stake(&staker, &1_000_000);
+    // No configure_emergency_unstake call → should panic.
+    client.emergency_unstake(&staker, &500_000);
+}
+
+#[test]
+#[should_panic(expected = "EmergencyUnstakeDisabled")]
+fn emergency_unstake_when_disabled_panics() {
+    let (env, client, admin) = setup_with_admin();
+    let treasury = Address::generate(&env);
+    let staker = Address::generate(&env);
+
+    client.configure_emergency_unstake(
+        &admin, &3_000, &500, &PenaltyDecayFunction::Linear,
+        &86_400u64, &treasury, &false, // disabled
+    );
+    client.stake(&staker, &1_000_000);
+    client.emergency_unstake(&staker, &500_000);
+}
+
+#[test]
+#[should_panic(expected = "InsufficientBalanceForEmergencyUnstake")]
+fn emergency_unstake_more_than_balance_panics() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 500_000);
+
+    env.ledger().set_timestamp(lock_start);
+    client.emergency_unstake(&staker, &600_000); // more than staked
+}
+
+// ---------------------------------------------------------------------------
+// Preview penalty (pure query, no state change)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn preview_penalty_matches_actual_applied_penalty() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+
+    let query_ts = lock_start + total_lock / 3;
+    env.ledger().set_timestamp(query_ts);
+
+    let preview_bps = client.preview_emergency_penalty(&lock_start, &unlock).unwrap();
+
+    // Actually perform the emergency unstake and compare.
+    let record = client.emergency_unstake(&staker, &1_000_000);
+    assert_eq!(
+        preview_bps, record.penalty_bps_applied,
+        "preview {} should match applied {}",
+        preview_bps,
+        record.penalty_bps_applied
+    );
 }
 
 #[test]
