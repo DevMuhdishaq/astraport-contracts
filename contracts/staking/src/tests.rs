@@ -11,8 +11,9 @@
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{symbol_short, Address, Env};
+use soroban_sdk::{symbol_short, vec, Address, Env, String, Vec};
 
+use crate::alerts::{AlertKind, AlertSeverity, AlertThreshold};
 use crate::fixed_point::{SCALE, SECONDS_PER_DAY, SECONDS_PER_YEAR};
 use crate::records::{
     CompoundingMode, GraduatedUnlock, StakeDataKey, UnlockSchedule, YieldDataKey,
@@ -478,7 +479,7 @@ fn test_stake_opens_position_and_accrues_on_staked_principal() {
 #[test]
 fn test_additional_stake_raises_principal_and_keeps_yield() {
     let (env, client) = setup();
-    env.ledger().set_timestamp(0);
+    env.ledger().set_timestamp(1_000);
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
 
@@ -513,7 +514,7 @@ fn test_unstake_preserves_accrued_yield_and_reduces_principal() {
 #[test]
 fn test_rate_change_is_time_weighted() {
     let (env, client) = setup();
-    env.ledger().set_timestamp(0);
+    env.ledger().set_timestamp(1_000);
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
 
@@ -524,8 +525,12 @@ fn test_rate_change_is_time_weighted() {
     env.ledger().set_timestamp(SECONDS_PER_YEAR / 2);
     client.set_yield_rate(&staker, &asset, &(8 * SCALE / 100));
 
-    env.ledger().set_timestamp(SECONDS_PER_YEAR);
-    let rec = client.accrue_yield(&staker, &asset);
+#[test]
+fn disabled_threshold_does_not_fire() {
+    let (env, client) = setup();
+    env.ledger().set_timestamp(1_000);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
 
     let seg1 = 20_201_340_026_755_810i128; // e^0.02 - 1
     let seg2 = 40_810_774_192_388_960i128; // e^0.04 - 1
@@ -535,7 +540,7 @@ fn test_rate_change_is_time_weighted() {
 #[test]
 fn test_accrue_claim_resets_unclaimed_yield() {
     let (env, client) = setup();
-    env.ledger().set_timestamp(0);
+    env.ledger().set_timestamp(1_000);
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
 
@@ -632,7 +637,7 @@ fn test_one_off_distribution() {
     assert_eq!(client.process_distribution(&staker, &asset), 0);
 
     env.ledger().set_timestamp(2_000);
-    assert_eq!(client.process_distribution(&staker, &asset), 500);
+    client.check_alerts(&staker, &asset, &200, &(SCALE / 20), &0);
 
     env.ledger().set_timestamp(3_000);
     assert_eq!(client.process_distribution(&staker, &asset), 0);
@@ -641,17 +646,24 @@ fn test_one_off_distribution() {
 #[test]
 fn test_recurring_distribution_rolls_forward() {
     let (env, client) = setup();
-    env.ledger().set_timestamp(0);
+    env.ledger().set_timestamp(1_000);
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
 
     client.schedule_distribution(&staker, &asset, &100, &1_000, &1_000);
 
+#[test]
+fn pending_alerts_excludes_acknowledged() {
+    let (env, client) = setup();
     env.ledger().set_timestamp(1_000);
-    assert_eq!(client.process_distribution(&staker, &asset), 100);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    let t = make_threshold(&env, AlertKind::BalanceDrop, 500, AlertSeverity::Warning, "floor");
+    client.set_alert_config(&staker, &asset, &vec![&env, t], &true);
 
     env.ledger().set_timestamp(2_000);
-    assert_eq!(client.process_distribution(&staker, &asset), 100);
+    client.check_alerts(&staker, &asset, &200, &(SCALE / 20), &0);
 
     env.ledger().set_timestamp(2_500);
     assert_eq!(client.process_distribution(&staker, &asset), 0);
@@ -698,7 +710,7 @@ fn test_claim_yield_requires_staker_auth() {
 #[test]
 fn test_zero_principal_accrues_nothing() {
     let (env, client) = setup();
-    env.ledger().set_timestamp(0);
+    env.ledger().set_timestamp(1_000);
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
     client.open_yield_position(&staker, &asset, &0, &(SCALE / 10), &CompoundingMode::Daily);

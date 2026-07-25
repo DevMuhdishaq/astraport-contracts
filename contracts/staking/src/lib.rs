@@ -27,6 +27,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
 
+pub mod alerts;
 pub mod apy;
 pub mod compounding;
 pub mod engine;
@@ -35,6 +36,7 @@ pub mod multi_asset;
 pub mod projection;
 pub mod records;
 
+use crate::alerts::{AlertConfig, AlertHistoryEntry, AlertMonitor, AlertThreshold};
 use crate::apy::APYCalculator;
 use crate::engine::YieldEngine;
 use crate::fixed_point::SCALE;
@@ -352,20 +354,17 @@ impl StakingContract {
     /// returned and the position's unclaimed counter is reset to zero.
     pub fn claim_yield(env: Env, staker: Address, asset: Symbol) -> i128 {
         staker.require_auth();
-
         let engine = YieldEngine::new(&env);
         let record = engine
             .accrue(&staker, &asset)
             .expect("failed to accrue yield before claim");
         let claimed = engine.finalize_claim(record);
-
         env.events()
             .publish((symbol_short!("YLDCLAIM"), staker, asset), claimed);
         claimed
     }
 
-    /// The total yield a position has earned as of now (checkpointed plus
-    /// pending), without mutating storage.
+    /// The total yield a position has earned as of now, without mutating storage.
     pub fn current_yield(env: Env, staker: Address, asset: Symbol) -> i128 {
         YieldEngine::new(&env)
             .current_yield(&staker, &asset)
@@ -385,7 +384,7 @@ impl StakingContract {
         env: Env,
         staker: Address,
         asset: Symbol,
-    ) -> soroban_sdk::Vec<YieldHistoryEntry> {
+    ) -> Vec<YieldHistoryEntry> {
         YieldEngine::new(&env).history(&staker, &asset)
     }
 
@@ -408,8 +407,6 @@ impl StakingContract {
     }
 
     /// Convert a nominal APR to its effective APY under a compounding mode.
-    ///
-    /// Both values are fixed-point fractions (see [`fixed_point::SCALE`]).
     pub fn apr_to_apy(_env: Env, apr: i128, mode: CompoundingMode) -> i128 {
         APYCalculator::apr_to_apy(apr, mode.to_strategy()).expect("apr_to_apy failed")
     }
@@ -444,8 +441,7 @@ impl StakingContract {
         )
     }
 
-    /// Process due distributions for a staker/asset as of the current ledger
-    /// time, returning the total amount that became due.
+    /// Process due distributions for a staker/asset as of the current ledger time.
     pub fn process_distribution(env: Env, staker: Address, asset: Symbol) -> i128 {
         YieldEngine::new(&env).process_distribution(&staker, &asset)
     }
