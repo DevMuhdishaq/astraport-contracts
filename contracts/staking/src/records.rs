@@ -185,16 +185,27 @@ pub struct StakingConfig {
 
 /// Storage keys for the staking layer that sits in front of the yield engine.
 ///
-/// Note: `Balance` is keyed by staker address only (not by asset). The current
-/// contract manages a single aggregate balance per staker. If per-asset balances
-/// are needed in the future, the key should be extended to `Balance(Address, Symbol)`.
+/// Balances are keyed by `(staker, asset)` so the protocol can track totals
+/// per asset and a distinct-active-staker count globally.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub enum StakeDataKey {
-    /// The current staked balance for a staker address, in base units.
-    Balance(Address),
+    /// The current staked balance for a `(staker, asset)` pair, in base units.
+    Balance(Address, Symbol),
     /// The default [`StakingConfig`] used when opening new positions.
     Config,
     /// The [`LockPosition`] for a staker address, if any.
     LockPosition(Address),
+    /// Running aggregate of every staker's balance for one asset, in base
+    /// units. Maintained by `stake`/`unstake`/`emergency_unstake`.
+    TotalStaked(Symbol),
+    /// Global count of distinct stakers with at least one non-zero balance
+    /// across any asset. Maintained alongside the per-staker
+    /// [`StakeDataKey::StakerPositionCount`] so the count can be derived
+    /// without scanning storage when a position reaches zero.
+    ActiveStakerCount,
+    /// Number of distinct (staker, asset) positions a staker currently holds
+    /// with non-zero balance. Used internally to transition the
+    /// [`StakeDataKey::ActiveStakerCount`] on full exits.
+    StakerPositionCount(Address),
 }

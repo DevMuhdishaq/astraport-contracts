@@ -14,7 +14,7 @@ use soroban_sdk::{symbol_short, vec, Address, Env, String, Vec};
 use crate::emergency::PenaltyDecayFunction;
 use crate::fixed_point::{SCALE, SECONDS_PER_DAY, SECONDS_PER_YEAR};
 use crate::records::{
-    CompoundingMode, GraduatedUnlock, StakeDataKey, UnlockSchedule, YieldDataKey,
+    CompoundingMode, StakeDataKey, YieldDataKey,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,17 +122,17 @@ fn test_stake_and_unstake() {
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
 
-    assert_eq!(client.stake(&staker, &100), symbol_short!("done"));
-    assert_eq!(client.get_balance(&staker), 100);
+    assert_eq!(client.stake(&staker, &asset, &100), symbol_short!("ok"));
+    assert_eq!(client.get_balance(&staker, &asset), 100);
 
-    assert_eq!(client.stake(&staker, &50), symbol_short!("done"));
-    assert_eq!(client.get_balance(&staker), 150);
+    assert_eq!(client.stake(&staker, &asset, &50), symbol_short!("ok"));
+    assert_eq!(client.get_balance(&staker, &asset), 150);
 
-    assert_eq!(client.unstake(&staker, &75), symbol_short!("done"));
-    assert_eq!(client.get_balance(&staker), 75);
+    assert_eq!(client.unstake(&staker, &asset, &75), symbol_short!("ok"));
+    assert_eq!(client.get_balance(&staker, &asset), 75);
 
-    assert_eq!(client.unstake(&staker, &75), symbol_short!("done"));
-    assert_eq!(client.get_balance(&staker), 0);
+    assert_eq!(client.unstake(&staker, &asset, &75), symbol_short!("ok"));
+    assert_eq!(client.get_balance(&staker, &asset), 0);
 }
 
 #[test]
@@ -166,8 +166,9 @@ fn test_unstake_more_than_balance() {
     env.mock_all_auths();
     let (_, client) = setup();
     let staker = Address::generate(&env);
-    client.stake(&staker, &100);
-    client.unstake(&staker, &150);
+    let asset = symbol_short!("XLM");
+    client.stake(&staker, &asset, &100);
+    client.unstake(&staker, &asset, &150);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,8 +184,9 @@ fn test_stake_requires_auth() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
     let staker = Address::generate(&env);
-    client.stake(&staker, &1_000);
-    assert_eq!(client.get_balance(&staker), 1_000);
+    let asset = symbol_short!("XLM");
+    client.stake(&staker, &asset, &1_000);
+    assert_eq!(client.get_balance(&staker, &asset), 1_000);
 }
 
 #[test]
@@ -196,8 +198,9 @@ fn test_stake_unauthorized() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
     let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
     // No mock_auths — require_auth will fail.
-    client.stake(&staker, &1_000);
+    client.stake(&staker, &asset, &1_000);
 }
 
 #[test]
@@ -357,7 +360,8 @@ fn setup_emergency(
     );
 
     // Stake.
-    client.stake(&staker, &stake_amount);
+    let asset = symbol_short!("XLM");
+    client.stake(&staker, &asset, &stake_amount);
 
     // Register lock position.
     client.set_lock_position(&admin, &staker, &lock_start_ts, &unlock_ts, &stake_amount);
@@ -376,7 +380,8 @@ fn emergency_unstake_at_start_applies_max_penalty() {
 
     // At t = lock_start (elapsed = 0) → start penalty = 30% (3000 bps).
     env.ledger().set_timestamp(lock_start);
-    let record = client.emergency_unstake(&staker, &1_000_000);
+    let asset = symbol_short!("XLM");
+    let record = client.emergency_unstake(&staker, &asset, &1_000_000);
 
     assert_eq!(record.penalty_bps_applied, 3_000);
     assert_eq!(record.penalty_amount, 300_000);    // 30% of 1_000_000
@@ -396,7 +401,8 @@ fn emergency_unstake_at_end_applies_min_penalty() {
 
     // At unlock (elapsed == total) → end penalty = 5% (500 bps).
     env.ledger().set_timestamp(unlock);
-    let record = client.emergency_unstake(&staker, &1_000_000);
+    let asset = symbol_short!("XLM");
+    let record = client.emergency_unstake(&staker, &asset, &1_000_000);
 
     assert_eq!(record.penalty_bps_applied, 500);
     assert_eq!(record.penalty_amount, 50_000);     // 5% of 1_000_000
@@ -414,7 +420,8 @@ fn emergency_unstake_at_midpoint_applies_mid_penalty() {
 
     // At midpoint linear decay: penalty ~= (3000+500)/2 = 1750 bps.
     env.ledger().set_timestamp(lock_start + total_lock / 2);
-    let record = client.emergency_unstake(&staker, &2_000_000);
+    let asset = symbol_short!("XLM");
+    let record = client.emergency_unstake(&staker, &asset, &2_000_000);
 
     let expected_bps = 1_750i128;
     let diff = (record.penalty_bps_applied - expected_bps).abs();
@@ -433,12 +440,13 @@ fn emergency_unstake_partial_reduces_balance_correctly() {
 
     // Partially unstake half.
     env.ledger().set_timestamp(lock_start);
-    let record = client.emergency_unstake(&staker, &500_000);
+    let asset = symbol_short!("XLM");
+    let record = client.emergency_unstake(&staker, &asset, &500_000);
 
     assert!(record.is_partial, "should be marked partial");
     assert_eq!(record.amount_requested, 500_000);
     // Balance reduced by full gross amount (500_000), not by net.
-    assert_eq!(client.get_balance(&staker), 500_000);
+    assert_eq!(client.get_balance(&staker, &asset), 500_000);
 }
 
 #[test]
@@ -451,9 +459,10 @@ fn emergency_unstake_updates_history() {
         setup_emergency(lock_start, unlock, 1_000_000);
 
     env.ledger().set_timestamp(lock_start + total_lock / 4);
-    client.emergency_unstake(&staker, &200_000);
+    let asset = symbol_short!("XLM");
+    client.emergency_unstake(&staker, &asset, &200_000);
     env.ledger().set_timestamp(lock_start + total_lock * 2);  // past cooldown
-    client.emergency_unstake(&staker, &100_000);
+    client.emergency_unstake(&staker, &asset, &100_000);
 
     let history = client.get_emergency_unstake_history(&staker);
     assert_eq!(history.len(), 2, "expected two emergency unstake records");
@@ -472,7 +481,8 @@ fn emergency_unstake_activates_cooldown() {
         setup_emergency(lock_start, unlock, 1_000_000);
 
     env.ledger().set_timestamp(lock_start);
-    client.emergency_unstake(&staker, &100_000);
+    let asset = symbol_short!("XLM");
+    client.emergency_unstake(&staker, &asset, &100_000);
 
     // Cooldown should be active immediately after.
     assert!(client.is_in_cooldown(&staker));
@@ -493,11 +503,12 @@ fn emergency_unstake_fails_during_cooldown() {
         setup_emergency(lock_start, unlock, 1_000_000);
 
     env.ledger().set_timestamp(lock_start);
-    client.emergency_unstake(&staker, &100_000);
+    let asset = symbol_short!("XLM");
+    client.emergency_unstake(&staker, &asset, &100_000);
 
     // Still within cooldown — this must panic.
     env.ledger().set_timestamp(lock_start + 3600); // only 1 hour later, cooldown = 1 day
-    client.emergency_unstake(&staker, &100_000);
+    client.emergency_unstake(&staker, &asset, &100_000);
 }
 
 #[test]
@@ -511,12 +522,13 @@ fn cooldown_expires_and_second_emergency_unstake_succeeds() {
         setup_emergency(lock_start, unlock, 1_000_000);
 
     env.ledger().set_timestamp(lock_start);
-    client.emergency_unstake(&staker, &100_000);
+    let asset = symbol_short!("XLM");
+    client.emergency_unstake(&staker, &asset, &100_000);
 
     // After cooldown, another emergency unstake succeeds.
     env.ledger().set_timestamp(lock_start + cooldown + 1);
     assert!(!client.is_in_cooldown(&staker));
-    let record = client.emergency_unstake(&staker, &100_000);
+    let record = client.emergency_unstake(&staker, &asset, &100_000);
     assert_eq!(record.amount_requested, 100_000);
 }
 
@@ -537,14 +549,15 @@ fn emergency_unstake_exponential_midpoint_lower_than_linear() {
     env_lin.ledger().set_timestamp(lock_start);
     let treasury_lin = Address::generate(&env_lin);
     let staker_lin = Address::generate(&env_lin);
+    let asset_lin = symbol_short!("XLM");
     client_lin.configure_emergency_unstake(
         &admin_lin, &4_000, &400, &PenaltyDecayFunction::Linear,
         &0u64, &treasury_lin, &true,
     );
-    client_lin.stake(&staker_lin, &stake);
+    client_lin.stake(&staker_lin, &asset_lin, &stake);
     client_lin.set_lock_position(&admin_lin, &staker_lin, &lock_start, &unlock, &stake);
     env_lin.ledger().set_timestamp(lock_start + total_lock / 2);
-    let rec_lin = client_lin.emergency_unstake(&staker_lin, &stake);
+    let rec_lin = client_lin.emergency_unstake(&staker_lin, &asset_lin, &stake);
 
     // Exponential config.
     let (env_exp, client_exp, admin_exp) = setup_with_admin();
@@ -552,14 +565,15 @@ fn emergency_unstake_exponential_midpoint_lower_than_linear() {
     env_exp.ledger().set_timestamp(lock_start);
     let treasury_exp = Address::generate(&env_exp);
     let staker_exp = Address::generate(&env_exp);
+    let asset_exp = symbol_short!("XLM");
     client_exp.configure_emergency_unstake(
         &admin_exp, &4_000, &400, &PenaltyDecayFunction::Exponential,
         &0u64, &treasury_exp, &true,
     );
-    client_exp.stake(&staker_exp, &stake);
+    client_exp.stake(&staker_exp, &asset_exp, &stake);
     client_exp.set_lock_position(&admin_exp, &staker_exp, &lock_start, &unlock, &stake);
     env_exp.ledger().set_timestamp(lock_start + total_lock / 2);
-    let rec_exp = client_exp.emergency_unstake(&staker_exp, &stake);
+    let rec_exp = client_exp.emergency_unstake(&staker_exp, &asset_exp, &stake);
 
     assert!(
         rec_exp.penalty_bps_applied < rec_lin.penalty_bps_applied,
@@ -579,9 +593,10 @@ fn emergency_unstake_without_config_panics() {
     let (env, client, _admin) = setup_with_admin();
     env.mock_all_auths();
     let staker = Address::generate(&env);
-    client.stake(&staker, &1_000_000);
+    let asset = symbol_short!("XLM");
+    client.stake(&staker, &asset, &1_000_000);
     // No configure_emergency_unstake call → should panic.
-    client.emergency_unstake(&staker, &500_000);
+    client.emergency_unstake(&staker, &asset, &500_000);
 }
 
 #[test]
@@ -595,8 +610,9 @@ fn emergency_unstake_when_disabled_panics() {
         &admin, &3_000, &500, &PenaltyDecayFunction::Linear,
         &86_400u64, &treasury, &false, // disabled
     );
-    client.stake(&staker, &1_000_000);
-    client.emergency_unstake(&staker, &500_000);
+    let asset = symbol_short!("XLM");
+    client.stake(&staker, &asset, &1_000_000);
+    client.emergency_unstake(&staker, &asset, &500_000);
 }
 
 #[test]
@@ -610,7 +626,8 @@ fn emergency_unstake_more_than_balance_panics() {
         setup_emergency(lock_start, unlock, 500_000);
 
     env.ledger().set_timestamp(lock_start);
-    client.emergency_unstake(&staker, &600_000); // more than staked
+    let asset = symbol_short!("XLM");
+    client.emergency_unstake(&staker, &asset, &600_000); // more than staked
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +649,8 @@ fn preview_penalty_matches_actual_applied_penalty() {
     let preview_bps = client.preview_emergency_penalty(&lock_start, &unlock).unwrap();
 
     // Actually perform the emergency unstake and compare.
-    let record = client.emergency_unstake(&staker, &1_000_000);
+    let asset = symbol_short!("XLM");
+    let record = client.emergency_unstake(&staker, &asset, &1_000_000);
     assert_eq!(
         preview_bps, record.penalty_bps_applied,
         "preview {} should match applied {}",
@@ -650,4 +668,196 @@ fn test_zero_principal_accrues_nothing() {
     client.open_yield_position(&staker, &asset, &0, &(SCALE / 10), &CompoundingMode::Daily);
     env.ledger().set_timestamp(SECONDS_PER_YEAR);
     assert_eq!(client.accrue_yield(&staker, &asset).accrued_yield, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Protocol-level totals: total_staked(asset) + staker_count()
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_totals_initial_state() {
+    let (env, _client) = setup();
+    env.mock_all_auths();
+    let xlm = symbol_short!("XLM");
+    let usdc = symbol_short!("USDC");
+    assert_eq!(_client.total_staked(&xlm), 0);
+    assert_eq!(_client.total_staked(&usdc), 0);
+    assert_eq!(_client.staker_count(), 0);
+}
+
+#[test]
+fn test_total_staked_reflects_stake_and_unstake_one_staker() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let staker = Address::generate(&env);
+    let xlm = symbol_short!("XLM");
+
+    client.stake(&staker, &xlm, &1_000);
+    assert_eq!(client.total_staked(&xlm), 1_000);
+    assert_eq!(client.staker_count(), 1);
+
+    client.stake(&staker, &xlm, &500);
+    assert_eq!(client.total_staked(&xlm), 1_500);
+    assert_eq!(client.staker_count(), 1, "same staker, same asset: count stays at 1");
+
+    // Partial unstake keeps both stakers count and total above zero.
+    client.unstake(&staker, &xlm, &700);
+    assert_eq!(client.total_staked(&xlm), 800);
+    assert_eq!(client.staker_count(), 1);
+
+    // Full exit drains total AND decrements staker count to zero.
+    client.unstake(&staker, &xlm, &800);
+    assert_eq!(client.total_staked(&xlm), 0);
+    assert_eq!(client.staker_count(), 0);
+}
+
+#[test]
+fn test_total_staked_sums_across_multiple_stakers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let carol = Address::generate(&env);
+    let xlm = symbol_short!("XLM");
+
+    client.stake(&alice, &xlm, &1_000);
+    client.stake(&bob, &xlm, &2_500);
+    client.stake(&carol, &xlm, &750);
+
+    assert_eq!(client.total_staked(&xlm), 1_000 + 2_500 + 750);
+    assert_eq!(client.staker_count(), 3);
+
+    // Cross-check: sum of balances equals total_staked.
+    assert_eq!(
+        client.get_balance(&alice, &xlm)
+            .checked_add(client.get_balance(&bob, &xlm))
+            .and_then(|s| s.checked_add(client.get_balance(&carol, &xlm)))
+            .unwrap(),
+        client.total_staked(&xlm),
+    );
+}
+
+#[test]
+fn test_totals_are_per_asset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let staker = Address::generate(&env);
+    let xlm = symbol_short!("XLM");
+    let usdc = symbol_short!("USDC");
+
+    client.stake(&staker, &xlm, &1_000);
+    client.stake(&staker, &usdc, &5_000);
+
+    assert_eq!(client.total_staked(&xlm), 1_000);
+    assert_eq!(client.total_staked(&usdc), 5_000);
+    // Distinct staker (one address) with two active positions still counts as 1.
+    assert_eq!(client.staker_count(), 1);
+
+    // Full exit on XLM leaves USDC untouched.
+    client.unstake(&staker, &xlm, &1_000);
+    assert_eq!(client.total_staked(&xlm), 0);
+    assert_eq!(client.total_staked(&usdc), 5_000);
+    assert_eq!(client.staker_count(), 1, "still active in usdc");
+
+    // Full exit on USDC brings staker count to zero.
+    client.unstake(&staker, &usdc, &5_000);
+    assert_eq!(client.total_staked(&usdc), 0);
+    assert_eq!(client.staker_count(), 0);
+}
+
+#[test]
+fn test_staker_count_increments_only_on_first_active_position() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+
+    let s1 = Address::generate(&env);
+    let s2 = Address::generate(&env);
+    let s3 = Address::generate(&env);
+    let xlm = symbol_short!("XLM");
+
+    assert_eq!(client.staker_count(), 0);
+
+    client.stake(&s1, &xlm, &100);
+    assert_eq!(client.staker_count(), 1);
+
+    client.stake(&s1, &xlm, &50); // same (staker, asset); no increment
+    client.stake(&s2, &xlm, &100); // new staker
+    assert_eq!(client.staker_count(), 2);
+
+    client.stake(&s3, &xlm, &200); // new staker
+    assert_eq!(client.staker_count(), 3);
+
+    // Partial unstakes do NOT change staker_count.
+    client.unstake(&s1, &xlm, &50);
+    client.unstake(&s2, &xlm, &50);
+    assert_eq!(client.staker_count(), 3);
+
+    // Full exit of one staker decrements by exactly 1.
+    client.unstake(&s1, &xlm, &100);
+    assert_eq!(client.staker_count(), 2);
+
+    // Full exit of a second staker.
+    client.unstake(&s3, &xlm, &200);
+    assert_eq!(client.staker_count(), 1);
+
+    // And the last one.
+    client.unstake(&s2, &xlm, &50);
+    assert_eq!(client.staker_count(), 0);
+}
+
+#[test]
+fn test_totals_update_on_emergency_unstake() {
+    let lock_start = 0u64;
+    let total_lock = 30u64 * 24 * 3600;
+    let unlock = lock_start + total_lock;
+
+    let (env, client, _admin, staker, _treasury) =
+        setup_emergency(lock_start, unlock, 1_000_000);
+    let asset = symbol_short!("XLM");
+
+    // After setup_emergency: one staker, total_staked = 1_000_000.
+    assert_eq!(client.total_staked(&asset), 1_000_000);
+    assert_eq!(client.staker_count(), 1);
+
+    // Partial emergency unstake keeps count above zero and reduces total by gross.
+    env.ledger().set_timestamp(lock_start);
+    client.emergency_unstake(&staker, &asset, &400_000);
+    assert_eq!(client.total_staked(&asset), 600_000);
+    assert_eq!(client.staker_count(), 1);
+
+    // Full emergency exit returns total to zero AND drops staker count to zero.
+    env.ledger().set_timestamp(lock_start + total_lock * 2 + 1);
+    client.emergency_unstake(&staker, &asset, &600_000);
+    assert_eq!(client.total_staked(&asset), 0);
+    assert_eq!(client.staker_count(), 0);
+}
+
+#[test]
+fn test_totals_handle_re_stake_after_full_exit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StakingContract);
+    let client = StakingContractClient::new(&env, &contract_id);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+
+    client.stake(&staker, &asset, &500);
+    assert_eq!(client.staker_count(), 1);
+    client.unstake(&staker, &asset, &500);
+    assert_eq!(client.staker_count(), 0);
+    assert_eq!(client.total_staked(&asset), 0);
+
+    // Re-stake after full exit: counter and total come back.
+    client.stake(&staker, &asset, &500);
+    assert_eq!(client.staker_count(), 1);
+    assert_eq!(client.total_staked(&asset), 500);
 }

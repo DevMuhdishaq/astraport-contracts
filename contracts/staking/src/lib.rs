@@ -35,7 +35,6 @@ pub mod compounding;
 pub mod emergency;
 pub mod engine;
 pub mod fixed_point;
-pub mod multi_asset;
 pub mod projection;
 pub mod records;
 
@@ -47,7 +46,6 @@ use crate::emergency::{
 };
 use crate::engine::YieldEngine;
 use crate::fixed_point::SCALE;
-use crate::multi_asset::MultiAssetStaking;
 use crate::projection::YieldProjector;
 use crate::records::{
     CompoundingMode, DistributionSchedule, LockPosition, StakeDataKey, StakingConfig,
@@ -143,20 +141,30 @@ impl StakingContract {
     // Staking
     // -----------------------------------------------------------------------
 
-    /// Stake assets into the contract.
+    /// Stake `amount` of `asset` into the contract.
     ///
-    /// Requires authorization from the staker. Increases the staker's balance
-    /// by `amount` and emits a `StakeEvent`.
-    pub fn stake(env: Env, staker: Address, amount: i128) -> Result<Symbol, Error> {
+    /// Requires authorization from `staker`. Increases the staker's balance
+    /// for `(staker, asset)` by `amount`, maintains the protocol-level
+    /// `TotalStaked(asset)` aggregate and the distinct-active-staker count,
+    /// and emits a `StakeEvent`.
+    pub fn stake(
+        env: Env,
+        staker: Address,
+        asset: Symbol,
+        amount: i128,
+    ) -> Result<Symbol, Error> {
         staker.require_auth();
 
         if amount <= 0 {
             return Err(Error::InvalidStakeAmount);
         }
-        let key = StakeDataKey::Balance(staker.clone());
-        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let new_balance = current_balance + amount;
+        let key = StakeDataKey::Balance(staker.clone(), asset.clone());
+        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or_default();
+        let new_balance = current_balance.checked_add(amount).ok_or(Error::InvalidStakeAmount)?;
         env.storage().persistent().set(&key, &new_balance);
+
+        Self::update_totals_on_stake(&env, &staker, &asset, current_balance, new_balance);
+
         env.events().publish(
             (symbol_short!("stake"), staker.clone()),
             StakeEvent {
@@ -166,25 +174,32 @@ impl StakingContract {
                 new_balance,
             },
         );
-        Ok(new_balance)
+        Ok(symbol_short!("ok"))
     }
 
-    /// Unstake assets from the contract (normal, after lock expiry).
+    /// Unstake `amount` of `asset` from the contract (normal, after lock expiry).
     ///
-    /// Requires authorization from the staker. Decreases the staker's balance
-    /// by `amount` and emits an `UnstakeEvent`. Panics if the staker's balance
-    /// is insufficient.
+    /// Requires authorization from `staker`. Decreases the staker's balance
+    /// for `(staker, asset)` by `amount`, maintains the protocol-level
+    /// `TotalStaked(asset)` aggregate and the distinct-active-staker count,
+    /// and emits an `UnstakeEvent`. Returns an error if the staker's
+    /// balance is insufficient.
     ///
     /// For early withdrawal before the lock expires, use
     /// [`Self::emergency_unstake`] instead.
-    pub fn unstake(env: Env, staker: Address, amount: i128) -> Result<Symbol, Error> {
+    pub fn unstake(
+        env: Env,
+        staker: Address,
+        asset: Symbol,
+        amount: i128,
+    ) -> Result<Symbol, Error> {
         staker.require_auth();
 
         if amount <= 0 {
             return Err(Error::InvalidStakeAmount);
         }
-        let key = StakeDataKey::Balance(staker.clone());
-        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let key = StakeDataKey::Balance(staker.clone(), asset.clone());
+        let current_balance: i128 = env.storage().persistent().get(&key).unwrap_or_default();
         if amount > current_balance {
             return Err(Error::InsufficientBalance);
         }
@@ -194,30 +209,55 @@ impl StakingContract {
         } else {
             env.storage().persistent().set(&key, &new_balance);
         }
+
+        Self::update_totals_on_unstake(&env, &staker, &asset, current_balance, new_balance);
+
         env.events().publish(
             (symbol_short!("unstake"), staker.clone()),
             UnstakeEvent {
                 staker,
                 asset,
                 amount,
-                new_balance: remaining,
+                new_balance,
             },
         );
-        Ok(remaining)
+        Ok(symbol_short!("ok"))
     }
 
-    /// Return the staked balance for a `(staker, asset)` pair.
+    /// Return the staked balance for a `(staker, asset)` pair, defaulting to 0.
     pub fn get_balance(env: Env, staker: Address, asset: Symbol) -> i128 {
         env.storage()
             .persistent()
             .get(&StakeDataKey::Balance(staker, asset))
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 
-    /// Get the staked balance for an address.
-    pub fn get_balance(env: Env, staker: Address) -> i128 {
-        let key = StakeDataKey::Balance(staker);
-        env.storage().persistent().get(&key).unwrap_or(0)
+    // -----------------------------------------------------------------------
+    // Protocol-level totals
+    // -----------------------------------------------------------------------
+
+    /// Total amount of `asset` currently staked across every staker.
+    ///
+    /// Maintained incrementally by `stake` / `unstake` / `emergency_unstake`
+    /// and equals the sum of every non-zero balance for the asset.
+    pub fn total_staked(env: Env, asset: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&StakeDataKey::TotalStaked(asset))
+            .unwrap_or_default()
+    }
+
+    /// Number of distinct stakers with at least one non-zero balance across
+    /// any asset.
+    ///
+    /// Incremented the first time a staker takes a balance above zero in any
+    /// asset, and decremented when their last non-zero balance returns to zero
+    /// (across any asset).
+    pub fn staker_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&StakeDataKey::ActiveStakerCount)
+            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -337,6 +377,7 @@ impl StakingContract {
     pub fn emergency_unstake(
         env: Env,
         staker: Address,
+        asset: Symbol,
         amount: i128,
     ) -> EmergencyUnstakeRecord {
         staker.require_auth();
@@ -346,12 +387,12 @@ impl StakingContract {
         }
 
         // --- current balance --------------------------------------------
-        let balance_key = StakeDataKey::Balance(staker.clone());
+        let balance_key = StakeDataKey::Balance(staker.clone(), asset.clone());
         let current_balance: i128 = env
             .storage()
             .persistent()
             .get(&balance_key)
-            .unwrap_or(0);
+            .unwrap_or_default();
 
         assert!(
             amount <= current_balance,
@@ -392,6 +433,9 @@ impl StakingContract {
         } else {
             env.storage().persistent().set(&balance_key, &new_balance);
         }
+
+        // --- update protocol-level totals (same semantics as unstake) --
+        Self::update_totals_on_unstake(&env, &staker, &asset, current_balance, new_balance);
 
         // --- update lock position locked_amount -------------------------
         if let Some(mut pos) = env
@@ -609,13 +653,13 @@ impl StakingContract {
         assert!(stored_admin == *admin, "caller is not admin");
     }
 
-    /// Read the staked balance for an address, defaulting to `0`.
+    /// Read the staked balance for a `(staker, asset)` pair, defaulting to `0`.
     #[allow(dead_code)]
-    fn balance_of(env: &Env, staker: &Address) -> i128 {
+    fn balance_of(env: &Env, staker: &Address, asset: &Symbol) -> i128 {
         env.storage()
             .persistent()
-            .get(&StakeDataKey::Balance(staker.clone()))
-            .unwrap_or(0)
+            .get(&StakeDataKey::Balance(staker.clone(), asset.clone()))
+            .unwrap_or_default()
     }
 
     /// Load the configured yield defaults, falling back to the built-in
@@ -628,26 +672,114 @@ impl StakingContract {
             .unwrap_or(StakingConfig {
                 default_apr: DEFAULT_APR,
                 default_mode: DEFAULT_MODE,
-            });
+            })
+    }
 
-        AssetYieldRate {
-            asset: asset.clone(),
-            apr: global.default_apr,
-            mode: global.default_mode,
-            min_stake: 0,
-            max_stake: 0,
-            unlock_schedule: UnlockSchedule::Immediate,
+    // -------------------------------------------------------------------
+    // Protocol-level totals maintenance
+    // -------------------------------------------------------------------
+
+    /// Update `TotalStaked(asset)` and the distinct-active-staker count on
+    /// a stake, given the previous and new per-pair balance.
+    ///
+    /// # Counter transitions
+    ///
+    /// - The active-staker count is incremented exactly once when a staker
+    ///   transitions from zero to positive balance for any asset (i.e. they
+    ///   become an active staker for the first time).
+    /// - `TotalStaked(asset)` is increased by the staked delta.
+    fn update_totals_on_stake(
+        env: &Env,
+        staker: &Address,
+        asset: &Symbol,
+        previous_balance: i128,
+        new_balance: i128,
+    ) {
+        assert!(
+            new_balance >= previous_balance,
+            "stake must not reduce a balance"
+        );
+
+        // TotalStaked(asset) += delta.
+        let total_key = StakeDataKey::TotalStaked(asset.clone());
+        let current_total: i128 = env
+            .storage()
+            .persistent()
+            .get(&total_key)
+            .unwrap_or_default();
+        let delta = new_balance - previous_balance;
+        env.storage().persistent().set(
+            &total_key,
+            &current_total.checked_add(delta).expect("TotalStaked overflow"),
+        );
+
+        // ActiveStakerCount++ if this is the staker's first active position.
+        if previous_balance == 0 && new_balance > 0 {
+            let pos_key = StakeDataKey::StakerPositionCount(staker.clone());
+            let prev_positions: u32 = env.storage().persistent().get(&pos_key).unwrap_or_default();
+            let new_positions = prev_positions + 1;
+            env.storage().persistent().set(&pos_key, &new_positions);
+            if prev_positions == 0 {
+                let count_key = StakeDataKey::ActiveStakerCount;
+                let count: u32 = env.storage().persistent().get(&count_key).unwrap_or_default();
+                env.storage().persistent().set(&count_key, &(count + 1));
+            }
         }
     }
 
-    /// Panic if `caller` is not the stored admin.
-    fn assert_admin(env: &Env, caller: &Address) {
-        let stored: Address = env
+    /// Update `TotalStaked(asset)` and the distinct-active-staker count on
+    /// an unstake (or emergency unstake), given the previous and new
+    /// per-pair balance.
+    ///
+    /// # Counter transitions
+    ///
+    /// - The active-staker count is decremented exactly once when a staker's
+    ///   final active position is removed (their last non-zero balance across
+    ///   all assets transitions to zero).
+    /// - `TotalStaked(asset)` is decreased by the unstaked delta.
+    fn update_totals_on_unstake(
+        env: &Env,
+        staker: &Address,
+        asset: &Symbol,
+        previous_balance: i128,
+        new_balance: i128,
+    ) {
+        assert!(
+            new_balance <= previous_balance,
+            "unstake must not increase a balance"
+        );
+
+        // TotalStaked(asset) -= delta.
+        let total_key = StakeDataKey::TotalStaked(asset.clone());
+        let current_total: i128 = env
             .storage()
             .persistent()
-            .get(&YieldDataKey::Admin)
-            .expect("contract not initialized");
-        assert!(stored == *caller, "caller is not admin");
+            .get(&total_key)
+            .unwrap_or_default();
+        let delta = previous_balance - new_balance;
+        env.storage().persistent().set(
+            &total_key,
+            &current_total.checked_sub(delta).expect("TotalStaked underflow"),
+        );
+
+        // Decrement staker-position count when this pair's balance hits zero.
+        // If their last active position is gone, also decrement the global
+        // active-staker count.
+        if previous_balance > 0 && new_balance == 0 {
+            let pos_key = StakeDataKey::StakerPositionCount(staker.clone());
+            let prev_positions: u32 = env.storage().persistent().get(&pos_key).unwrap_or_default();
+            // prev_positions must be >= 1 for this path; saturating_sub avoids
+            // panics from any (theoretical) state divergence.
+            let new_positions = prev_positions.saturating_sub(1);
+            env.storage().persistent().set(&pos_key, &new_positions);
+            if new_positions == 0 {
+                let count_key = StakeDataKey::ActiveStakerCount;
+                let count: u32 = env.storage().persistent().get(&count_key).unwrap_or_default();
+                env.storage()
+                    .persistent()
+                    .set(&count_key, &count.saturating_sub(1));
+            }
+        }
     }
 }
 
