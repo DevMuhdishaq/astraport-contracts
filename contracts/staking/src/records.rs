@@ -208,4 +208,7 @@ pub enum StakeDataKey {
     /// with non-zero balance. Used internally to transition the
     /// [`StakeDataKey::ActiveStakerCount`] on full exits.
     StakerPositionCount(Address),
+    /// Optional audit-log sink address. When set, the staking contract
+    /// invokes the audit contract on every state-changing event.
+    AuditSink,
 }
