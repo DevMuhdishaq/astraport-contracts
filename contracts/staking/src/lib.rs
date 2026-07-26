@@ -30,6 +30,9 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
 };
 
+use astraport_audit::logger::AuditLogger;
+use astraport_audit::records::{permissions, AuditEventType, StateSnapshot};
+
 pub mod alerts;
 pub mod apy;
 pub mod compounding;
@@ -169,6 +172,18 @@ impl StakingContract {
 
         Self::update_totals_on_stake(&env, &staker, &asset, current_balance, new_balance);
 
+        Self::log_audit_if_configured(
+            &env,
+            &staker,
+            &asset,
+            current_balance,
+            new_balance,
+            AuditEventType::Stake,
+            permissions::STAKER,
+            symbol_short!("ok"),
+            "stake",
+        );
+
         env.events().publish(
             (symbol_short!("stake"), staker.clone()),
             StakeEvent {
@@ -215,6 +230,18 @@ impl StakingContract {
         }
 
         Self::update_totals_on_unstake(&env, &staker, &asset, current_balance, new_balance);
+
+        Self::log_audit_if_configured(
+            &env,
+            &staker,
+            &asset,
+            current_balance,
+            new_balance,
+            AuditEventType::Unstake,
+            permissions::STAKER,
+            symbol_short!("ok"),
+            "unstake",
+        );
 
         env.events().publish(
             (symbol_short!("unstake"), staker.clone()),
@@ -458,6 +485,18 @@ impl StakingContract {
                     .set(&StakeDataKey::LockPosition(staker), &pos);
             }
         }
+
+        Self::log_audit_if_configured(
+            &env,
+            &staker,
+            &asset,
+            current_balance,
+            new_balance,
+            AuditEventType::EmergencyUnstake,
+            permissions::STAKER,
+            symbol_short!("ok"),
+            "emergency_unstake",
+        );
 
         record
     }
@@ -783,6 +822,61 @@ impl StakingContract {
                     .persistent()
                     .set(&count_key, &count.saturating_sub(1));
             }
+        }
+    }
+}
+
+/// Integration with the audit-log contract.
+impl StakingContract {
+    /// Configure the audit-log sink address. Admin-only.
+    pub fn set_audit_sink(env: Env, admin: Address, sink: Address) -> Symbol {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        env.storage().persistent().set(&StakeDataKey::AuditSink, &sink);
+        symbol_short!("ok")
+    }
+
+    /// Read the audit-log sink address, if configured.
+    pub fn get_audit_sink(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&StakeDataKey::AuditSink)
+    }
+
+    /// Append an audit event if a sink is configured. No-op otherwise.
+    ///
+    /// We use the asset symbol as the audit portfolio id and the staker's
+    /// `(before, after)` balance as the state snapshot. The outcome is
+    /// passed through verbatim from the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn log_audit_if_configured(
+        env: &Env,
+        actor: &Address,
+        asset: &Symbol,
+        before_balance: i128,
+        after_balance: i128,
+        event_type: AuditEventType,
+        perms: u32,
+        outcome: Symbol,
+        detail: &str,
+    ) {
+        let key = StakeDataKey::AuditSink;
+        let sink: Option<Address> = env.storage().persistent().get(&key);
+        if let Some(sink) = sink {
+            let mut before = StateSnapshot::empty(env);
+            before.push(asset.clone(), before_balance);
+            let mut after = StateSnapshot::empty(env);
+            after.push(asset.clone(), after_balance);
+            let detail_str = soroban_sdk::String::from_str(env, detail);
+            let logger = AuditLogger::new(env, &sink);
+            let _ = logger.log_event(
+                actor.clone(),
+                event_type,
+                asset.clone(),
+                perms,
+                before,
+                after,
+                outcome,
+                detail_str,
+            );
         }
     }
 }

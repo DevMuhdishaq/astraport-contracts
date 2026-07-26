@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "contracts/audit",
     "contracts/rebalancing",
     "contracts/events",
     "contracts/staking",
