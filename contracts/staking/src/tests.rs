@@ -49,40 +49,6 @@ fn approx(a: i128, b: i128, tol: i128) {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn setup() -> (Env, StakingContractClient<'static>) {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, StakingContract);
-    let client = StakingContractClient::new(&env, &contract_id);
-    (env, client)
-}
-
-fn setup_with_admin() -> (Env, StakingContractClient<'static>, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, StakingContract);
-    let client = StakingContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-    (env, client, admin)
-}
-
-/// Assert `a` and `b` are within `tol`.
-fn approx(a: i128, b: i128, tol: i128) {
-    let diff = (a - b).abs();
-    assert!(
-        diff <= tol,
-        "expected {} ~= {} within {}, diff {}",
-        a,
-        b,
-        tol,
-        diff
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Smoke tests
 // ---------------------------------------------------------------------------
 
@@ -160,7 +126,6 @@ fn test_stake_multiple_assets_independently() {
 }
 
 #[test]
-#[should_panic(expected = "InsufficientBalance")]
 fn test_unstake_more_than_balance() {
     let env = Env::default();
     env.mock_all_auths();
@@ -168,7 +133,17 @@ fn test_unstake_more_than_balance() {
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
     client.stake(&staker, &asset, &100);
-    client.unstake(&staker, &asset, &150);
+    // `unstake` returns `Result<Symbol, Error>`; soroban-sdk auto-generates
+    // `try_unstake` which returns
+    //   Result<
+    //     Result<Symbol, soroban_sdk::ConversionError>,
+    //     Result<crate::Error, soroban_sdk::InvokeError>
+    //   >
+    // i.e. outer Err + inner Ok = contract returned its own Error variant.
+    assert_eq!(
+        client.try_unstake(&staker, &asset, &150),
+        Err(Ok(crate::Error::InsufficientBalance)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +270,8 @@ fn accrue_claim_and_reclaim_resets_unclaimed_yield() {
 fn configure_emergency_unstake_stores_config() {
     let (env, client, admin) = setup_with_admin();
     let treasury = Address::generate(&env);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("XLM");
 
     client.configure_emergency_unstake(
         &admin,
