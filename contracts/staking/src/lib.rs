@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 //! # AstraPort Staking Contract
 //!
 //! Manages asset staking together with an accurate, compounding **yield
@@ -38,7 +39,6 @@ pub mod fixed_point;
 pub mod projection;
 pub mod records;
 
-use crate::alerts::{AlertConfig, AlertHistoryEntry, AlertMonitor, AlertThreshold};
 use crate::apy::APYCalculator;
 use crate::emergency::{
     EmergencyDataKey, EmergencyUnstakeConfig, EmergencyUnstakeExecutor, EmergencyUnstakeQuery,
@@ -119,6 +119,10 @@ pub struct UnstakeEvent {
 #[contract]
 pub struct StakingContract;
 
+// Soroban contract entrypoints unavoidably carry a long argument list
+// (Env, Address, ...). The crate-level `#![allow(clippy::too_many_arguments)]`
+// (above `#![no_std]`) blanket-suppresses this lint for both the manual impl
+// and the `contractimpl`-macro expansion.
 #[contractimpl]
 impl StakingContract {
     // -----------------------------------------------------------------------

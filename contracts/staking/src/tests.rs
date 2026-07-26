@@ -9,13 +9,11 @@
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{symbol_short, vec, Address, Env, String, Vec};
+use soroban_sdk::{symbol_short, Address, Env};
 
 use crate::emergency::PenaltyDecayFunction;
 use crate::fixed_point::{SCALE, SECONDS_PER_DAY, SECONDS_PER_YEAR};
-use crate::records::{
-    CompoundingMode, StakeDataKey, YieldDataKey,
-};
+use crate::records::CompoundingMode;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,7 +63,7 @@ fn test_initialize() {
 #[test]
 #[should_panic(expected = "already initialized")]
 fn test_double_initialize_panics() {
-    let (env, client, admin) = setup_with_admin();
+    let (_env, client, admin) = setup_with_admin();
     client.initialize(&admin);
 }
 
@@ -180,7 +178,7 @@ fn test_stake_unauthorized() {
 
 #[test]
 fn test_set_alert_threshold_requires_admin_auth() {
-    let (env, client, admin) = setup_with_admin();
+    let (_env, client, admin) = setup_with_admin();
     client.set_alert_threshold(&admin, &10_000);
 }
 

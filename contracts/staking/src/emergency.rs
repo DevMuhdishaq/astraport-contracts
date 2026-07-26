@@ -490,7 +490,6 @@ impl EmergencyUnstakeQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixed_point::SCALE;
     use soroban_sdk::testutils::Address as _;
 
     // Helper: create a minimal config for tests.

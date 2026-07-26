@@ -466,7 +466,7 @@ impl<'a> AlertMonitor<'a> {
         index: u32,
     ) {
         let key = AlertDataKey::History(staker.clone(), asset.clone());
-        let mut log: Vec<AlertHistoryEntry> = self
+        let log: Vec<AlertHistoryEntry> = self
             .env
             .storage()
             .persistent()
