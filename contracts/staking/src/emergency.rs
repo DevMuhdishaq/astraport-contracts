@@ -222,8 +222,12 @@ impl PenaltyCalculator {
         let t = fp::div(elapsed as i128, total as i128)?;
 
         // ratio = end / start  (fixed-point)
-        let start_fp = fp::mul(start, SCALE / BPS_SCALE)?;
-        let end_fp = fp::mul(end, SCALE / BPS_SCALE)?;
+        // Use plain integer multiplication rather than `fp::mul` here. The fixed-
+        // point helper divides by SCALE inside the call, which truncates the
+        // intermediate to 0 for typical BPS values (e.g. start = 4000) and
+        // produces a spurious DivideByZero in the next division.
+        let start_fp = start * (SCALE / BPS_SCALE);
+        let end_fp = end * (SCALE / BPS_SCALE);
         let ratio = fp::div(end_fp, start_fp)?;
 
         // ln(ratio) and exponent = ln(ratio) * t
@@ -486,7 +490,7 @@ impl EmergencyUnstakeQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixed_point::SCALE;
+    use soroban_sdk::testutils::Address as _;
 
     // Helper: create a minimal config for tests.
     fn test_config(
@@ -494,24 +498,17 @@ mod tests {
         end_bps: i128,
         decay: PenaltyDecayFunction,
     ) -> EmergencyUnstakeConfig {
-        // Treasury address is irrelevant for pure math tests; use a dummy.
-        // We cannot construct soroban Address outside an Env, so we use a
-        // placeholder approach by having a wrapper test in lib-level tests.
-        // Here we just verify the math.
+        // Treasury address is irrelevant for pure math tests; a valid
+        // placeholder is generated from a dummy Env. Note: `Address` cannot be
+        // zero-initialized in this soroban-sdk version, so `core::mem::zeroed()`
+        // (the previous hack) panics at first use.
+        let env = Env::default();
         EmergencyUnstakeConfig {
             penalty_start_bps: start_bps,
             penalty_end_bps: end_bps,
             decay_function: decay,
             cooldown_seconds: 86_400,
-            // SAFETY: We cannot build Address without Env here; the fields
-            // below are not exercised in unit tests that only call the pure
-            // PenaltyCalculator functions.
-            treasury: unsafe {
-                // This is a no-std hack — these unit tests only exercise
-                // PenaltyCalculator which doesn't dereference `treasury`.
-                // Integration-level tests (with Env) construct Address properly.
-                core::mem::zeroed()
-            },
+            treasury: Address::generate(&env),
             enabled: true,
         }
     }
