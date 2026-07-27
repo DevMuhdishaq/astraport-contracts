@@ -36,6 +36,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "astraport-audit"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "astraport-events"
 version = "0.1.0"
 dependencies = [
@@ -46,6 +53,7 @@ dependencies = [
 name = "astraport-rebalancing"
 version = "0.1.0"
 dependencies = [
+ "astraport-audit",
  "soroban-sdk",
 ]
 
@@ -53,6 +61,7 @@ dependencies = [
 name = "astraport-staking"
 version = "0.1.0"
 dependencies = [
+ "astraport-audit",
  "soroban-sdk",
 ]
 
