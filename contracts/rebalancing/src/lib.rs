@@ -22,6 +22,8 @@ pub enum RebalancingError {
     CurrentHoldingsNotFound = 4,
     /// An error occurred during multi-asset rebalancing.
     MultiAssetRebalanceFailed = 5,
+    /// Caller is not authorized to modify this portfolio.
+    Unauthorized = 6,
 }
 
 #[contracttype]
@@ -109,6 +111,8 @@ pub enum DataKey {
     /// Optional audit-log sink address. When set, the rebalancing contract
     /// invokes the audit contract on every state-changing event.
     AuditSink,
+    /// Portfolio owner address mapping: portfolio_id -> Address
+    Owner(Symbol),
 }
 
 /// Event data for manual rebalance - includes drift summary via timestamp
@@ -170,14 +174,42 @@ impl RebalancingContract {
         symbol_short!("ok")
     }
 
+    /// Helper to enforce portfolio owner authorization.
+    /// If no owner is recorded yet for `portfolio_id`, registers `owner` as owner.
+    /// Calls `owner.require_auth()` and ensures `owner` matches the recorded owner.
+    fn require_owner_auth(
+        env: &Env,
+        owner: &Address,
+        portfolio_id: &Symbol,
+    ) -> Result<(), RebalancingError> {
+        owner.require_auth();
+        let key = DataKey::Owner(portfolio_id.clone());
+        if let Some(stored_owner) = env.storage().persistent().get::<DataKey, Address>(&key) {
+            if &stored_owner != owner {
+                return Err(RebalancingError::Unauthorized);
+            }
+        } else {
+            env.storage().persistent().set(&key, owner);
+        }
+        Ok(())
+    }
+
+    /// Get the owner address for a portfolio if set.
+    pub fn get_owner(env: Env, portfolio_id: Symbol) -> Option<Address> {
+        let key = DataKey::Owner(portfolio_id);
+        env.storage().persistent().get(&key)
+    }
+
     /// Compute a rebalance plan from the stored target allocation and current
     /// holdings. The plan only includes assets whose absolute drift is greater
     /// than the configured threshold. A manual rebalance is recorded in the
     /// execution history.
     pub fn rebalance(
         env: Env,
+        owner: Address,
         portfolio_id: Symbol,
     ) -> Result<RebalanceResult, RebalancingError> {
+        Self::require_owner_auth(&env, &owner, &portfolio_id)?;
         let result = Self::calculate_rebalance(&env, &portfolio_id)?;
         Self::record_execution(
             &env,
@@ -224,7 +256,15 @@ impl RebalancingContract {
         symbol_short!("ok")
     }
 
-    pub fn set_schedule(env: Env, portfolio_id: Symbol, interval: RebalanceInterval) -> Symbol {
+    pub fn set_schedule(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        interval: RebalanceInterval,
+    ) -> Symbol {
+        if Self::require_owner_auth(&env, &owner, &portfolio_id).is_err() {
+            return symbol_short!("err_auth");
+        }
         if !ScheduleValidator::validate(&interval) {
             return symbol_short!("err_val");
         }
@@ -247,7 +287,15 @@ impl RebalancingContract {
         symbol_short!("ok")
     }
 
-    pub fn update_schedule(env: Env, portfolio_id: Symbol, interval: RebalanceInterval) -> Symbol {
+    pub fn update_schedule(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        interval: RebalanceInterval,
+    ) -> Symbol {
+        if Self::require_owner_auth(&env, &owner, &portfolio_id).is_err() {
+            return symbol_short!("err_auth");
+        }
         if !ScheduleValidator::validate(&interval) {
             return symbol_short!("err_val");
         }
@@ -271,7 +319,10 @@ impl RebalancingContract {
         symbol_short!("ok")
     }
 
-    pub fn cancel_schedule(env: Env, portfolio_id: Symbol) -> Symbol {
+    pub fn cancel_schedule(env: Env, owner: Address, portfolio_id: Symbol) -> Symbol {
+        if Self::require_owner_auth(&env, &owner, &portfolio_id).is_err() {
+            return symbol_short!("err_auth");
+        }
         let key = DataKey::Schedule(portfolio_id.clone());
         if !env.storage().persistent().has(&key) {
             return symbol_short!("err_none");
@@ -289,6 +340,7 @@ impl RebalancingContract {
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
+    /// * `owner` - Portfolio owner address
     /// * `portfolio_id` - Identifier for the portfolio
     /// * `allocation` - Target allocation with asset→basis-points weights
     ///
@@ -297,9 +349,11 @@ impl RebalancingContract {
     /// `Err(RebalancingError::InvalidAllocation)` if weights don't sum to 10_000.
     pub fn set_target_allocation(
         env: Env,
+        owner: Address,
         portfolio_id: Symbol,
         allocation: TargetAllocation,
     ) -> Result<Symbol, RebalancingError> {
+        Self::require_owner_auth(&env, &owner, &portfolio_id)?;
         let mut total: u32 = 0;
         for (_asset, weight) in allocation.allocations.iter() {
             total += weight;
@@ -330,9 +384,11 @@ impl RebalancingContract {
     /// are expressed in basis points and must total 10_000.
     pub fn set_current_holdings(
         env: Env,
+        owner: Address,
         portfolio_id: Symbol,
         holdings: CurrentHoldings,
     ) -> Result<Symbol, RebalancingError> {
+        Self::require_owner_auth(&env, &owner, &portfolio_id)?;
         let mut total: u32 = 0;
         for (_asset, weight) in holdings.allocations.iter() {
             total += weight;
@@ -352,9 +408,16 @@ impl RebalancingContract {
 
     /// Set the per-portfolio drift tolerance in basis points. The default is
     /// 100 bps when this value has not been configured.
-    pub fn set_drift_threshold_bps(env: Env, portfolio_id: Symbol, threshold_bps: u32) {
+    pub fn set_drift_threshold_bps(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        threshold_bps: u32,
+    ) -> Result<(), RebalancingError> {
+        Self::require_owner_auth(&env, &owner, &portfolio_id)?;
         let key = DataKey::DriftThreshold(portfolio_id);
         env.storage().persistent().set(&key, &threshold_bps);
+        Ok(())
     }
 
     pub fn get_drift_threshold_bps(env: Env, portfolio_id: Symbol) -> u32 {
@@ -475,9 +538,11 @@ impl RebalancingContract {
 
     pub fn execute_rebalance(
         env: Env,
+        owner: Address,
         portfolio_id: Symbol,
         strategy: multi_asset_rebalancer::ExecutionStrategy,
     ) -> Result<(), RebalancingError> {
+        Self::require_owner_auth(&env, &owner, &portfolio_id)?;
         let rebalancer_id = env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
         let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
         client.rebalance(&portfolio_id, &strategy);
@@ -647,8 +712,7 @@ impl RebalancingContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Ledger, Env, Map};
-
+    use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Env, Map};
 
     fn weights(env: &Env, entries: &[(Symbol, u32)]) -> Map<Symbol, u32> {
         let mut result = Map::new(env);
@@ -669,24 +733,33 @@ mod tests {
 
     #[test]
     fn test_rebalance_no_drift_does_not_flag_assets_and_logs_manual_execution() {
-        let env = Env::default(); let client = client(&env); let portfolio = symbol_short!("port1");
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio = symbol_short!("port1");
         let allocation = weights(&env, &[(symbol_short!("USDC"), 6_000), (symbol_short!("XLM"), 4_000)]);
-        client.set_target_allocation(&portfolio, &TargetAllocation { allocations: allocation.clone() });
-        client.set_current_holdings(&portfolio, &CurrentHoldings { allocations: allocation });
-        let result = client.rebalance(&portfolio);
+        client.set_target_allocation(&owner, &portfolio, &TargetAllocation { allocations: allocation.clone() });
+        client.set_current_holdings(&owner, &portfolio, &CurrentHoldings { allocations: allocation });
+        let result = client.rebalance(&owner, &portfolio);
         assert_eq!(result.adjustments.len(), 0);
         let history = client.get_execution_history(&portfolio);
         assert_eq!(history.len(), 1);
         assert_eq!(history.get(0).unwrap().details, symbol_short!("manual"));
+        assert_eq!(client.get_owner(&portfolio), Some(owner));
     }
 
     #[test]
     fn test_rebalance_flags_single_asset_drift_with_direction() {
-        let env = Env::default(); let client = client(&env); let portfolio = symbol_short!("port1");
-        client.set_target_allocation(&portfolio, &TargetAllocation { allocations: weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 3_000), (symbol_short!("BTC"), 2_000)]) });
-        client.set_current_holdings(&portfolio, &CurrentHoldings { allocations: weights(&env, &[(symbol_short!("USDC"), 5_250), (symbol_short!("XLM"), 2_900), (symbol_short!("BTC"), 1_850)]) });
-        client.set_drift_threshold_bps(&portfolio, &200);
-        let result = client.rebalance(&portfolio);
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio = symbol_short!("port1");
+        client.set_target_allocation(&owner, &portfolio, &TargetAllocation { allocations: weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 3_000), (symbol_short!("BTC"), 2_000)]) });
+        client.set_current_holdings(&owner, &portfolio, &CurrentHoldings { allocations: weights(&env, &[(symbol_short!("USDC"), 5_250), (symbol_short!("XLM"), 2_900), (symbol_short!("BTC"), 1_850)]) });
+        client.set_drift_threshold_bps(&owner, &portfolio, &200);
+        let result = client.rebalance(&owner, &portfolio);
         assert_eq!(result.adjustments.len(), 1);
         let adjustment = result.adjustments.get(0).unwrap();
         assert_eq!(adjustment.asset, symbol_short!("USDC"));
@@ -696,11 +769,15 @@ mod tests {
 
     #[test]
     fn test_rebalance_flags_multiple_assets_and_includes_buy_and_sell() {
-        let env = Env::default(); let client = client(&env); let portfolio = symbol_short!("port1");
-        client.set_target_allocation(&portfolio, &TargetAllocation { allocations: weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 3_000), (symbol_short!("BTC"), 2_000)]) });
-        client.set_current_holdings(&portfolio, &CurrentHoldings { allocations: weights(&env, &[(symbol_short!("USDC"), 5_300), (symbol_short!("XLM"), 2_700), (symbol_short!("BTC"), 2_000)]) });
-        client.set_drift_threshold_bps(&portfolio, &100);
-        let result = client.rebalance(&portfolio);
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio = symbol_short!("port1");
+        client.set_target_allocation(&owner, &portfolio, &TargetAllocation { allocations: weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 3_000), (symbol_short!("BTC"), 2_000)]) });
+        client.set_current_holdings(&owner, &portfolio, &CurrentHoldings { allocations: weights(&env, &[(symbol_short!("USDC"), 5_300), (symbol_short!("XLM"), 2_700), (symbol_short!("BTC"), 2_000)]) });
+        client.set_drift_threshold_bps(&owner, &portfolio, &100);
+        let result = client.rebalance(&owner, &portfolio);
         assert_eq!(result.adjustments.len(), 2);
         assert_eq!(result.adjustments.get(0).unwrap().direction, RebalanceDirection::Sell);
         assert_eq!(result.adjustments.get(1).unwrap().direction, RebalanceDirection::Buy);
@@ -708,11 +785,15 @@ mod tests {
 
     #[test]
     fn test_scheduled_rebalance_execution() {
-        let env = Env::default(); let client = client(&env); let portfolio = symbol_short!("port1");
-        client.set_schedule(&portfolio, &RebalanceInterval::Hourly);
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio = symbol_short!("port1");
+        client.set_schedule(&owner, &portfolio, &RebalanceInterval::Hourly);
         let allocation = weights(&env, &[(symbol_short!("USDC"), 10_000)]);
-        client.set_target_allocation(&portfolio, &TargetAllocation { allocations: allocation.clone() });
-        client.set_current_holdings(&portfolio, &CurrentHoldings { allocations: allocation });
+        client.set_target_allocation(&owner, &portfolio, &TargetAllocation { allocations: allocation.clone() });
+        client.set_current_holdings(&owner, &portfolio, &CurrentHoldings { allocations: allocation });
         assert_eq!(client.check_exec_sched_rebalance(&portfolio), symbol_short!("not_due"));
         let mut ledger = env.ledger().get(); ledger.timestamp = 3600; env.ledger().set(ledger);
         assert_eq!(client.check_exec_sched_rebalance(&portfolio), symbol_short!("done"));
@@ -720,4 +801,64 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history.get(0).unwrap().details, symbol_short!("schd_exec"));
     }
-}
+
+    #[test]
+    fn test_owner_registration_and_access_control() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner1 = Address::generate(&env);
+        let owner2 = Address::generate(&env);
+        let portfolio = symbol_short!("port1");
+
+        // First creation sets owner to owner1
+        let allocation = weights(&env, &[(symbol_short!("USDC"), 10_000)]);
+        let set_res = client.set_target_allocation(&owner1, &portfolio, &TargetAllocation { allocations: allocation.clone() });
+        assert_eq!(set_res, symbol_short!("ok"));
+        assert_eq!(client.get_owner(&portfolio), Some(owner1.clone()));
+
+        // owner1 can update schedule
+        assert_eq!(client.set_schedule(&owner1, &portfolio, &RebalanceInterval::Hourly), symbol_short!("ok"));
+        assert_eq!(client.update_schedule(&owner1, &portfolio, &RebalanceInterval::Daily), symbol_short!("ok"));
+
+        // owner2 attempts to mutate owner1's portfolio -> fails with err_auth / Unauthorized
+        assert_eq!(client.update_schedule(&owner2, &portfolio, &RebalanceInterval::Weekly), symbol_short!("err_auth"));
+        assert_eq!(client.cancel_schedule(&owner2, &portfolio), symbol_short!("err_auth"));
+        assert_eq!(client.set_schedule(&owner2, &portfolio, &RebalanceInterval::Monthly), symbol_short!("err_auth"));
+
+        let set_res2 = client.try_set_target_allocation(&owner2, &portfolio, &TargetAllocation { allocations: allocation.clone() });
+        assert_eq!(set_res2, Err(Ok(RebalancingError::Unauthorized)));
+
+        let reb_res = client.try_rebalance(&owner2, &portfolio);
+        assert_eq!(reb_res, Err(Ok(RebalancingError::Unauthorized)));
+
+        // owner1 can cancel schedule successfully
+        assert_eq!(client.cancel_schedule(&owner1, &portfolio), symbol_short!("ok"));
+    }
+
+    #[test]
+    fn test_read_methods_remain_public_without_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio = symbol_short!("port1");
+
+        let allocation = weights(&env, &[(symbol_short!("USDC"), 10_000)]);
+        client.set_target_allocation(&owner, &portfolio, &TargetAllocation { allocations: allocation.clone() });
+        client.set_current_holdings(&owner, &portfolio, &CurrentHoldings { allocations: allocation });
+        client.set_schedule(&owner, &portfolio, &RebalanceInterval::Daily);
+
+        // Read operations without mock_all_auths
+        let env_no_auth = Env::default();
+        let id = env.register_contract(None, RebalancingContract);
+        let client_no_auth = RebalancingContractClient::new(&env_no_auth, &id);
+
+        assert_eq!(client.get_owner(&portfolio), Some(owner));
+        assert!(client.get_schedule(&portfolio).is_some());
+        assert!(client.get_target_allocation(&portfolio).is_some());
+        assert!(client.get_current_holdings(&portfolio).is_some());
+        assert_eq!(client.get_status(&portfolio), symbol_short!("ok"));
+        assert_eq!(client.get_drift_threshold_bps(&portfolio), DEFAULT_DRIFT_THRESHOLD_BPS);
+    }
+}
