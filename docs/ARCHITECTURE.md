@@ -9,11 +9,14 @@ AstraPort Smart Contracts is a suite of Soroban-based smart contracts built on t
 ### Contract Modules
 
 #### 1. Rebalancing Contract
-- **Purpose**: Manages portfolio rebalancing and allocation adjustments
+- **Purpose**: Manages portfolio rebalancing and allocation adjustments with portfolio-level ownership and access control
 - **Key Functions**:
   - `initialize()` - Initialize the contract
-  - `rebalance()` - Execute portfolio rebalancing
-  - `get_status()` - Query rebalancing status
+  - `set_target_allocation(owner, portfolio_id, allocation)` - Set target allocation (owner auth required)
+  - `set_schedule(owner, portfolio_id, interval)` - Set rebalancing schedule (owner auth required)
+  - `rebalance(owner, portfolio_id)` - Execute manual portfolio rebalancing (owner auth required)
+  - `get_owner(portfolio_id)` - Query portfolio owner address
+  - `get_status(portfolio_id)` - Query rebalancing status
 - **Use Cases**:
   - Automated portfolio rebalancing
   - Target allocation management
