@@ -1,6 +1,8 @@
 #![no_std]
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
 
+pub mod multi_asset_rebalancer;
+
 use astraport_audit::logger::AuditLogger;
 use astraport_audit::records::{permissions, AuditEventType, StateSnapshot};
 
@@ -543,9 +545,10 @@ impl RebalancingContract {
         strategy: multi_asset_rebalancer::ExecutionStrategy,
     ) -> Result<(), RebalancingError> {
         Self::require_owner_auth(&env, &owner, &portfolio_id)?;
+        let plan = Self::calculate_rebalance(&env, &portfolio_id)?;
         let rebalancer_id = env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
         let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
-        client.rebalance(&portfolio_id, &strategy);
+        client.rebalance(&portfolio_id, &strategy, &plan.adjustments);
         Ok(())
     }
 
@@ -554,9 +557,10 @@ impl RebalancingContract {
         portfolio_id: Symbol,
         strategy: multi_asset_rebalancer::ExecutionStrategy,
     ) -> Result<multi_asset_rebalancer::SimulationResult, RebalancingError> {
+        let plan = Self::calculate_rebalance(&env, &portfolio_id)?;
         let rebalancer_id = env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
         let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
-        Ok(client.simulate_rebalance(&portfolio_id, &strategy))
+        Ok(client.simulate_rebalance(&portfolio_id, &strategy, &plan.adjustments))
     }
 }
 
@@ -588,11 +592,11 @@ impl RebalancingContract {
         if let Some(sink) = sink {
             let mut before = StateSnapshot::empty(env);
             for (k, v) in balances_before.iter() {
-                before.push(k, *v as i128);
+                before.push(k, v as i128);
             }
             let mut after = StateSnapshot::empty(env);
             for (k, v) in balances_after.iter() {
-                after.push(k, *v as i128);
+                after.push(k, v as i128);
             }
             let detail_str = soroban_sdk::String::from_str(env, detail);
             let logger = AuditLogger::new(env, &sink);

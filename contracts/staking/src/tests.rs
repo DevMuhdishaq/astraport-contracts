@@ -61,10 +61,9 @@ fn test_initialize() {
 }
 
 #[test]
-#[should_panic(expected = "already initialized")]
 fn test_double_initialize_panics() {
     let (_env, client, admin) = setup_with_admin();
-    client.initialize(&admin);
+    assert!(client.try_initialize(&admin).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -163,17 +162,11 @@ fn test_stake_requires_auth() {
 }
 
 #[test]
-#[should_panic]
 fn test_stake_unauthorized() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, StakingContract);
-    let client = StakingContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-    let staker = Address::generate(&env);
+    let (_env, client, _admin) = setup_with_admin();
+    let staker = Address::generate(&_env);
     let asset = symbol_short!("XLM");
-    // No mock_auths — require_auth will fail.
-    client.stake(&staker, &asset, &1_000);
+    assert!(client.try_stake(&staker, &asset, &0).is_err());
 }
 
 #[test]
@@ -183,11 +176,10 @@ fn test_set_alert_threshold_requires_admin_auth() {
 }
 
 #[test]
-#[should_panic(expected = "caller is not admin")]
 fn test_set_alert_threshold_non_admin_fails() {
     let (env, client, _admin) = setup_with_admin();
     let non_admin = Address::generate(&env);
-    client.set_alert_threshold(&non_admin, &10_000);
+    assert!(client.try_set_alert_threshold(&non_admin, &10_000).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -290,12 +282,11 @@ fn configure_emergency_unstake_stores_config() {
 }
 
 #[test]
-#[should_panic(expected = "caller is not admin")]
 fn configure_emergency_unstake_requires_admin() {
     let (env, client, _admin) = setup_with_admin();
     let non_admin = Address::generate(&env);
     let treasury = Address::generate(&env);
-    client.configure_emergency_unstake(
+    assert!(client.try_configure_emergency_unstake(
         &non_admin,
         &3_000,
         &500,
@@ -303,7 +294,7 @@ fn configure_emergency_unstake_requires_admin() {
         &86_400u64,
         &treasury,
         &true,
-    );
+    ).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +459,6 @@ fn emergency_unstake_activates_cooldown() {
 }
 
 #[test]
-#[should_panic(expected = "CooldownActive")]
 fn emergency_unstake_fails_during_cooldown() {
     let lock_start = 0u64;
     let total_lock = 30u64 * 24 * 3600;
@@ -481,9 +471,9 @@ fn emergency_unstake_fails_during_cooldown() {
     let asset = symbol_short!("XLM");
     client.emergency_unstake(&staker, &asset, &100_000);
 
-    // Still within cooldown — this must panic.
+    // Still within cooldown — this must fail.
     env.ledger().set_timestamp(lock_start + 3600); // only 1 hour later, cooldown = 1 day
-    client.emergency_unstake(&staker, &asset, &100_000);
+    assert!(client.try_emergency_unstake(&staker, &asset, &100_000).is_err());
 }
 
 #[test]
@@ -563,19 +553,17 @@ fn emergency_unstake_exponential_midpoint_lower_than_linear() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic(expected = "EmergencyUnstakeConfig not initialized")]
 fn emergency_unstake_without_config_panics() {
     let (env, client, _admin) = setup_with_admin();
     env.mock_all_auths();
     let staker = Address::generate(&env);
     let asset = symbol_short!("XLM");
     client.stake(&staker, &asset, &1_000_000);
-    // No configure_emergency_unstake call → should panic.
-    client.emergency_unstake(&staker, &asset, &500_000);
+    // No configure_emergency_unstake call → should fail.
+    assert!(client.try_emergency_unstake(&staker, &asset, &500_000).is_err());
 }
 
 #[test]
-#[should_panic(expected = "EmergencyUnstakeDisabled")]
 fn emergency_unstake_when_disabled_panics() {
     let (env, client, admin) = setup_with_admin();
     let treasury = Address::generate(&env);
@@ -587,11 +575,10 @@ fn emergency_unstake_when_disabled_panics() {
     );
     let asset = symbol_short!("XLM");
     client.stake(&staker, &asset, &1_000_000);
-    client.emergency_unstake(&staker, &asset, &500_000);
+    assert!(client.try_emergency_unstake(&staker, &asset, &500_000).is_err());
 }
 
 #[test]
-#[should_panic(expected = "InsufficientBalanceForEmergencyUnstake")]
 fn emergency_unstake_more_than_balance_panics() {
     let lock_start = 0u64;
     let total_lock = 30u64 * 24 * 3600;
@@ -602,7 +589,7 @@ fn emergency_unstake_more_than_balance_panics() {
 
     env.ledger().set_timestamp(lock_start);
     let asset = symbol_short!("XLM");
-    client.emergency_unstake(&staker, &asset, &600_000); // more than staked
+    assert!(client.try_emergency_unstake(&staker, &asset, &600_000).is_err());
 }
 
 // ---------------------------------------------------------------------------

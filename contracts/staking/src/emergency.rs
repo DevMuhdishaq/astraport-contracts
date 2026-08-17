@@ -313,22 +313,28 @@ impl EmergencyUnstakeExecutor {
         current_balance: i128,
         lock_start_ts: u64,
         unlock_ts: u64,
-    ) -> EmergencyUnstakeRecord {
+    ) -> Result<EmergencyUnstakeRecord, crate::Error> {
         let now = env.ledger().timestamp();
 
         // --- load config --------------------------------------------------
-        let config: EmergencyUnstakeConfig = env
+        let config: EmergencyUnstakeConfig = match env
             .storage()
             .persistent()
             .get(&EmergencyDataKey::Config)
-            .expect("EmergencyUnstakeConfig not initialized");
+        {
+            Some(c) => c,
+            None => return Err(crate::Error::EmergencyConfigNotInitialized),
+        };
 
-        assert!(config.enabled, "EmergencyUnstakeDisabled");
-        assert!(amount > 0, "InvalidEmergencyUnstakeAmount");
-        assert!(
-            amount <= current_balance,
-            "InsufficientBalanceForEmergencyUnstake"
-        );
+        if !config.enabled {
+            return Err(crate::Error::EmergencyUnstakeDisabled);
+        }
+        if amount <= 0 {
+            return Err(crate::Error::InvalidEmergencyUnstakeAmount);
+        }
+        if amount > current_balance {
+            return Err(crate::Error::InsufficientBalance);
+        }
 
         // --- cooldown check -----------------------------------------------
         let cooldown_end: u64 = env
@@ -336,7 +342,9 @@ impl EmergencyUnstakeExecutor {
             .persistent()
             .get(&EmergencyDataKey::CooldownEnd(staker.clone()))
             .unwrap_or(0);
-        assert!(now >= cooldown_end, "CooldownActive");
+        if now < cooldown_end {
+            return Err(crate::Error::CooldownActive);
+        }
 
         // --- compute penalty ----------------------------------------------
         let total_lock_seconds = unlock_ts.saturating_sub(lock_start_ts);
@@ -347,7 +355,7 @@ impl EmergencyUnstakeExecutor {
             elapsed,
             total_lock_seconds,
         )
-        .expect("PenaltyCalculationFailed");
+        .map_err(|_| crate::Error::InvalidEmergencyUnstakeAmount)?;
 
         let (penalty_amount, amount_returned) =
             PenaltyCalculator::apply_penalty(amount, penalty_bps)
@@ -407,7 +415,7 @@ impl EmergencyUnstakeExecutor {
             record.clone(),
         );
 
-        record
+        Ok(record)
     }
 }
 
