@@ -38,6 +38,7 @@ pub mod apy;
 pub mod compounding;
 pub mod emergency;
 pub mod engine;
+pub mod multi_asset;
 pub mod fixed_point;
 pub mod projection;
 pub mod records;
@@ -85,6 +86,10 @@ pub enum Error {
     EmergencyConfigNotInitialized = 5,
     /// The amount requested for emergency unstake is invalid (≤ 0).
     InvalidEmergencyUnstakeAmount = 6,
+    /// The new balance would exceed the per-asset maximum stake.
+    ExceedsMaximumStake = 7,
+    /// The amount requested exceeds the currently unlocked portion.
+    ExceedsUnlockedAmount = 8,
     /// Unauthorized caller.
     Unauthorized = 7,
     /// Already initialized.

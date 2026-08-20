@@ -5,7 +5,7 @@
 //! pure-math results from [`crate::compounding`] and [`crate::apy`] into durable,
 //! queryable structures keyed by staker and asset.
 
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 /// The compounding model, mirrored as a `#[contracttype]` for storage.
 ///
@@ -208,7 +208,107 @@ pub enum StakeDataKey {
     /// with non-zero balance. Used internally to transition the
     /// [`StakeDataKey::ActiveStakerCount`] on full exits.
     StakerPositionCount(Address),
+    /// The [`StakingPosition`] for a `(staker, asset)` pair.
+    Position(Address, Symbol),
+    /// The list of asset symbols a staker is currently staked in.
+    StakerAssets(Address),
     /// Optional audit-log sink address. When set, the staking contract
     /// invokes the audit contract on every state-changing event.
     AuditSink,
+}
+
+// ---------------------------------------------------------------------------
+// Multi-asset staking types
+// ---------------------------------------------------------------------------
+
+/// An unlock schedule controlling when a staker may withdraw their principal.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub enum UnlockSchedule {
+    /// No lock-up; the full principal is immediately available.
+    Immediate,
+    /// All principal unlocks at the given timestamp.
+    Cliff(u64),
+    /// Principal unlocks in graduated tranches over time.
+    Graduated(GraduatedUnlock),
+}
+
+/// Parameters for a graduated (tranche-based) unlock schedule.
+
+/// Tranches are numbered 0, 1, 2, …  Tranche `k` unlocks at
+/// `start_ts + k * interval_seconds`. Each tranche releases
+/// `tranche_pct_bps / 10_000` of the original principal. The final
+/// tranche unlocks any remainder, ensuring 100% eventually unlocks.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct GraduatedUnlock {
+    /// Ledger timestamp (seconds) at which the first tranche unlocks.
+    pub start_ts: u64,
+    /// Interval in seconds between consecutive tranches.
+    pub interval_seconds: u64,
+    /// Percentage of principal unlocked per tranche, in basis points
+    /// (0–10 000). E.g. 2 500 means 25% per tranche.
+    pub tranche_pct_bps: u32,
+}
+
+/// Per-asset staking position tracked by the multi-asset layer.
+///
+/// This record sits alongside the [`YieldRecord`] in the yield engine and
+/// adds multi-asset–specific metadata such as unlock schedules and the
+/// position's opening timestamp.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct StakingPosition {
+    /// The staker who owns this position.
+    pub staker: Address,
+    /// The asset being staked.
+    pub asset: Symbol,
+    /// Principal currently staked, in base units.
+    pub principal: i128,
+    /// Annual percentage rate, fixed-point.
+    pub apr: i128,
+    /// Compounding model applied.
+    pub mode: CompoundingMode,
+    /// Ledger timestamp (seconds) when this position was opened.
+    pub opened_at: u64,
+    /// The unlock schedule governing withdrawals.
+    pub unlock_schedule: UnlockSchedule,
+    /// Yield realized and checkpointed to date, base units.
+    pub accrued_yield: i128,
+}
+
+/// Per-asset yield rate configuration used by the multi-asset facade.
+///
+/// Bundles the rate, compounding mode, optional cap, and unlock schedule
+/// that apply to a new position opened via [`crate::multi_asset::MultiAssetStaking`].
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct AssetYieldRate {
+    /// Annual percentage rate, fixed-point.
+    pub apr: i128,
+    /// Compounding model.
+    pub mode: CompoundingMode,
+    /// Maximum stake allowed per staker for this asset (0 = unlimited).
+    pub max_stake: i128,
+    /// The unlock schedule for positions in this asset.
+    pub unlock_schedule: UnlockSchedule,
+}
+
+/// Aggregate snapshot of all of a staker's active positions.
+///
+/// Built by [`crate::multi_asset::MultiAssetStaking::portfolio_snapshot`] as a
+/// read-only view; never persisted to storage.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct PortfolioSnapshot {
+    /// Sum of all positions' principals.
+    pub total_principal: i128,
+    /// Sum of all positions' live accrued yields.
+    pub total_accrued_yield: i128,
+    /// Number of active asset positions.
+    pub asset_count: u32,
+    /// Weighted-average APR across all positions (weighted by principal).
+    pub weighted_avg_apr: i128,
+    /// The individual positions.
+    pub positions: Vec<StakingPosition>,
 }
