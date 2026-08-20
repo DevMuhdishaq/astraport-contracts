@@ -28,7 +28,7 @@
 extern crate alloc;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 pub mod checksum;
@@ -192,7 +192,7 @@ impl AuditContract {
             state_after,
             outcome,
             detail,
-            hash,
+            hash: hash.clone(),
         };
 
         env.storage().persistent().set(&StorageKey::Entry(seq), &entry);
@@ -422,7 +422,7 @@ impl AuditContract {
         // Recompute the chain head from the new floor. If everything was pruned,
         // the head is reset to the chain origin; otherwise the head is the hash
         // of the lowest remaining entry.
-        let mut prev = BytesN::from_array(env, &records::CHAIN_ORIGIN);
+        let mut prev = BytesN::from_array(&env, &records::CHAIN_ORIGIN);
         if new_first <= next_seq {
             let mut s = new_first;
             while s <= next_seq {
@@ -433,7 +433,7 @@ impl AuditContract {
                     .get::<StorageKey, AuditLog>(&key)
                 {
                     let payload = entry_payload(
-                        env,
+                        &env,
                         e.seq,
                         e.timestamp,
                         e.event_type as u32,
@@ -446,9 +446,9 @@ impl AuditContract {
                         &e.state_after,
                     );
                     prev = if s == 1 {
-                        first_chain_hash(env, &payload)
+                        first_chain_hash(&env, &payload)
                     } else {
-                        chain_hash(env, &prev, &payload)
+                        chain_hash(&env, &prev, &payload)
                     };
                 }
                 s += 1;
