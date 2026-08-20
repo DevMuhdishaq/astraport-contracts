@@ -836,3 +836,401 @@ fn test_totals_handle_re_stake_after_full_exit() {
     assert_eq!(client.staker_count(), 1);
     assert_eq!(client.total_staked(&asset), 500);
 }
+
+// ===========================================================================
+// Yield Distribution & Claiming System Tests
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Reserve management
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reserve_initially_zero() {
+    let (_env, client, _admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    assert_eq!(client.reserve_balance(&asset), 0);
+}
+
+#[test]
+fn fund_reserve_increases_balance() {
+    let (env, client, admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    assert_eq!(client.fund_reserve(&admin, &asset, &1_000_000), 1_000_000);
+    assert_eq!(client.reserve_balance(&asset), 1_000_000);
+    // Fund again.
+    assert_eq!(client.fund_reserve(&admin, &asset, &500_000), 1_500_000);
+    assert_eq!(client.reserve_balance(&asset), 1_500_000);
+}
+
+#[test]
+fn withdraw_reserve_decreases_balance() {
+    let (env, client, admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    client.fund_reserve(&admin, &asset, &1_000_000);
+    assert_eq!(client.withdraw_reserve(&admin, &asset, &400_000), 600_000);
+    assert_eq!(client.reserve_balance(&asset), 600_000);
+}
+
+#[test]
+#[should_panic(expected = "InsufficientReserve")]
+fn withdraw_reserve_insufficient_panics() {
+    let (_env, client, admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    client.fund_reserve(&admin, &asset, &100_000);
+    client.withdraw_reserve(&admin, &asset, &200_000);
+}
+
+#[test]
+fn fund_requires_admin() {
+    let (env, client, _admin) = setup_with_admin();
+    let non_admin = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+    client.fund_reserve(&non_admin, &asset, &1_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// Partial claims
+// ---------------------------------------------------------------------------
+
+#[test]
+fn claim_yield_partial_basic() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    let available = client.current_yield(&staker, &asset);
+    assert!(available > 0);
+
+    // Claim half.
+    let half = available / 2;
+    let claimed = client.claim_yield_partial(&staker, &asset, &half);
+    assert_eq!(claimed, half);
+
+    // Remaining yield should be approximately half.
+    let remaining = client.current_yield(&staker, &asset);
+    approx(remaining, available - half, 1);
+}
+
+#[test]
+fn claim_yield_partial_claims_all_if_amount_exceeds() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    let available = client.current_yield(&staker, &asset);
+    let big_amount = available * 2;
+    let claimed = client.claim_yield_partial(&staker, &asset, &big_amount);
+    assert_eq!(claimed, available);
+    assert_eq!(client.current_yield(&staker, &asset), 0);
+}
+
+#[test]
+fn claim_yield_partial_zero_amount_fails() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    assert_eq!(client.try_claim_yield_partial(&staker, &asset, &0), Err(Ok(crate::Error::InvalidClaimAmount)));
+}
+
+#[test]
+fn claim_yield_partial_no_position_fails() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+    assert_eq!(client.try_claim_yield_partial(&staker, &asset, &1000), Err(Ok(crate::Error::NoYieldPosition)));
+}
+
+#[test]
+fn claim_yield_partial_capped_by_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    // Fund a small reserve.
+    client.fund_reserve(&admin, &asset, &1_000);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    // Available yield is much larger than reserve.
+    let available = client.current_yield(&staker, &asset);
+    assert!(available > 1_000);
+
+    // Claim should be capped to reserve.
+    let claimed = client.claim_yield_partial(&staker, &asset, &available);
+    assert_eq!(claimed, 1_000);
+    assert_eq!(client.reserve_balance(&asset), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Batch claiming
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_claim_multiple_stakers() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+    let apr = SCALE / 10; // 10%
+
+    // Open positions for both.
+    client.open_yield_position(&alice, &asset, &SCALE, &apr, &CompoundingMode::Daily);
+    client.open_yield_position(&bob, &asset, &(2 * SCALE), &apr, &CompoundingMode::Daily);
+
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    let alice_yield = client.current_yield(&alice, &asset);
+    let bob_yield = client.current_yield(&bob, &asset);
+    assert!(alice_yield > 0);
+    assert!(bob_yield > 0);
+
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+
+    assert_eq!(results.len(), 2);
+    let (a_addr, a_claimed) = results.get(0).unwrap();
+    let (b_addr, b_claimed) = results.get(1).unwrap();
+    assert_eq!(a_claimed, alice_yield);
+    assert_eq!(b_claimed, bob_yield);
+
+    // After batch claim, yields should be zero.
+    assert_eq!(client.current_yield(&alice, &asset), 0);
+    assert_eq!(client.current_yield(&bob, &asset), 0);
+}
+
+#[test]
+fn batch_claim_with_reserve_cap() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+    let apr = SCALE / 10;
+
+    client.open_yield_position(&alice, &asset, &SCALE, &apr, &CompoundingMode::Daily);
+    client.open_yield_position(&bob, &asset, &SCALE, &apr, &CompoundingMode::Daily);
+
+    // Small reserve — less than total accrued.
+    client.fund_reserve(&admin, &asset, &1_000_000_000);
+
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+
+    // Total claimed should be capped to reserve.
+    let total_claimed: i128 = results.iter().map(|(_, a)| a).sum();
+    assert!(total_claimed <= 1_000_000_000);
+    assert_eq!(client.reserve_balance(&asset), 1_000_000_000 - total_claimed);
+}
+
+#[test]
+fn batch_claim_no_yield_returns_zero() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    // No yield positions opened.
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0).unwrap().1, 0);
+    assert_eq!(results.get(1).unwrap().1, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Pause / unpause distributions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn distributions_not_paused_initially() {
+    let (env, client) = setup();
+    assert!(!client.distributions_paused());
+}
+
+#[test]
+fn pause_and_unpause() {
+    let (env, client, admin) = setup_with_admin();
+    assert_eq!(client.pause_distributions(&admin), symbol_short!("paused"));
+    assert!(client.distributions_paused());
+    assert_eq!(client.unpause_distributions(&admin), symbol_short!("active"));
+    assert!(!client.distributions_paused());
+}
+
+#[test]
+fn paused_batch_claim_returns_zero() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+    assert!(client.current_yield(&staker, &asset) > 0);
+
+    // Pause distributions.
+    client.pause_distributions(&admin);
+
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, staker.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+    assert_eq!(results.get(0).unwrap().1, 0);
+    // Yield should still be accrued (not consumed).
+    assert!(client.current_yield(&staker, &asset) > 0);
+}
+
+#[test]
+fn paused_process_distribution_returns_zero() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &0);
+    client.pause_distributions(&admin);
+    env.ledger().set_timestamp(200);
+
+    let paid = client.process_distribution(&staker, &asset);
+    assert_eq!(paid, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Distribution history
+// ---------------------------------------------------------------------------
+
+#[test]
+fn distribution_history_records_claims() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+    client.claim_yield(&staker, &asset);
+
+    let history = client.distribution_history(&staker, &asset);
+    assert!(history.len() >= 1);
+    let record = history.get(0).unwrap();
+    assert!(record.amount > 0);
+    assert_eq!(record.staker, staker);
+    assert_eq!(record.asset, asset);
+}
+
+#[test]
+fn total_yield_claimed_tracks_cumulative() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+    let first_claim = client.claim_yield(&staker, &asset);
+    assert!(first_claim > 0);
+
+    // Accumulate more yield.
+    env.ledger().set_timestamp(60 * SECONDS_PER_DAY);
+    let second_claim = client.claim_yield(&staker, &asset);
+    assert!(second_claim > 0);
+
+    let total = client.total_yield_claimed(&staker, &asset);
+    assert_eq!(total, first_claim + second_claim);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled distributions with reserve
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scheduled_distribution_funded_from_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    // Fund reserve.
+    client.fund_reserve(&admin, &asset, &1_000_000);
+
+    // Schedule a one-off distribution at ts=100.
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &0);
+
+    // Before due: nothing paid.
+    env.ledger().set_timestamp(50);
+    assert_eq!(client.process_distribution(&staker, &asset), 0);
+
+    // After due: paid from reserve.
+    env.ledger().set_timestamp(150);
+    assert_eq!(client.process_distribution(&staker, &asset), 100_000);
+    assert_eq!(client.reserve_balance(&asset), 900_000);
+}
+
+#[test]
+fn scheduled_distribution_skipped_when_insufficient_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    // Fund insufficient reserve.
+    client.fund_reserve(&admin, &asset, &50_000);
+
+    // Schedule distribution of 100_000.
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &0);
+
+    env.ledger().set_timestamp(200);
+    let paid = client.process_distribution(&staker, &asset);
+    // Should be skipped — reserve insufficient.
+    assert_eq!(paid, 0i128);
+    assert_eq!(client.reserve_balance(&asset), 50_000);
+}
+
+#[test]
+fn recurring_distribution_recurring_from_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.fund_reserve(&admin, &asset, &1_000_000);
+
+    // Recurring: 100_000 every 30 days starting at ts=100.
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &(30 * SECONDS_PER_DAY));
+
+    // First occurrence.
+    env.ledger().set_timestamp(150);
+    assert_eq!(client.process_distribution(&staker, &asset), 100_000);
+
+    // Second occurrence.
+    env.ledger().set_timestamp(100 + 30 * SECONDS_PER_DAY + 10);
+    assert_eq!(client.process_distribution(&staker, &asset), 100_000);
+
+    assert_eq!(client.reserve_balance(&asset), 800_000);
+}

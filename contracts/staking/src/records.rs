@@ -166,6 +166,12 @@ pub enum YieldDataKey {
     Admin,
     /// The alert threshold value.
     AlertThreshold,
+    /// Append-only log of [`YieldDistributionRecord`] for a `(staker, asset)` pair.
+    DistributionHistory(Address, Symbol),
+    /// The yield escrow/reserve balance for an asset.
+    ReserveBalance(Symbol),
+    /// Whether distributions are globally paused.
+    DistributionsPaused,
 }
 
 /// Default yield parameters applied when a position is first opened by a stake.
@@ -211,4 +217,40 @@ pub enum StakeDataKey {
     /// Optional audit-log sink address. When set, the staking contract
     /// invokes the audit contract on every state-changing event.
     AuditSink,
+}
+
+/// The type of a yield distribution event, distinguishing claims from
+/// scheduled payouts.
+#[contracttype]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributionType {
+    /// A staker-initiated on-demand claim.
+    Claim,
+    /// A scheduled (recurring or one-off) distribution.
+    Scheduled,
+    /// A batch claim covering multiple stakers in one transaction.
+    BatchClaim,
+}
+
+/// An immutable record of a single yield distribution.
+///
+/// Appended to the per-`(staker, asset)` distribution history log on every
+/// claim or scheduled payout, providing a complete, queryable audit trail.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct YieldDistributionRecord {
+    /// The staker who received the distribution.
+    pub staker: Address,
+    /// The asset that was distributed.
+    pub asset: Symbol,
+    /// Base-unit amount distributed to the staker.
+    pub amount: i128,
+    /// Ledger timestamp (seconds) at which the distribution occurred.
+    pub timestamp: u64,
+    /// Whether this was a claim, scheduled payout, or batch claim.
+    pub distribution_type: DistributionType,
+    /// Accrued yield at the time of distribution (before claim reset).
+    pub accrued_at_claim: i128,
+    /// Remaining reserve balance for the asset after this distribution.
+    pub reserve_after: i128,
 }
