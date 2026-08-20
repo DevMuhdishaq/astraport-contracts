@@ -1,6 +1,3 @@
-
-#![no_std]
-
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Env, Map, Symbol, Vec,
 };
@@ -209,7 +206,7 @@ impl MultiAssetRebalancer {
         slippage_factors.set((symbol_short!("USDC"), symbol_short!("BTC")), 1);
 
         let slippage_factor = slippage_factors
-            .get((*asset_to_sell, *asset_to_buy))
+            .get((asset_to_sell.clone(), asset_to_buy.clone()))
             .unwrap_or(20); // Default to 20 bps
 
         // Slippage is proportional to the amount sold.
@@ -218,23 +215,12 @@ impl MultiAssetRebalancer {
         Percentage(slippage_bps as u32)
     }
 
-    fn log_trade(env: &Env, trade: &Trade, fee: u128, slippage_bps: u128) {
-        env.logs().log(
-            "Rebalancing trade",
-            (
-                symbol_short!("sell"),
-                trade.asset_to_sell,
-                symbol_short!("buy"),
-                trade.asset_to_buy,
-                symbol_short!("amount"),
-                trade.amount_to_sell,
-                symbol_short!("expected"),
-                trade.expected_amount_to_buy,
-                symbol_short!("fee"),
-                fee,
-                symbol_short!("slippage"),
-                slippage_bps,
-            ),
+    fn log_trade(env: &Env, trade: &Trade, _fee: u128, _slippage_bps: u128) {
+        soroban_sdk::log!(
+            env,
+            "Rebalancing trade: sell={}, buy={}",
+            trade.asset_to_sell,
+            trade.asset_to_buy
         );
     }
 }

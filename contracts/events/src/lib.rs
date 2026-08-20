@@ -127,7 +127,7 @@ pub struct AITrigger {
     pub trigger_id: Symbol,
     pub name: Symbol,
     pub event_types: Vec<u32>, // Vec of EventType as u32
-    pub threshold: Option<U256>,
+    pub threshold: Option<i128>,
     pub operator: Option<u32>, // ComparisonOperator as u32
     pub ai_service_endpoint: Address,
     pub timeout: u64, // Timeout in milliseconds
@@ -137,8 +137,8 @@ pub struct AITrigger {
 
 /// Condition to evaluate against current values
 pub struct TriggerCondition {
-    pub current_value: U256,
-    pub threshold: U256,
+    pub current_value: i128,
+    pub threshold: i128,
     pub operator: ComparisonOperator,
 }
 
@@ -150,7 +150,7 @@ impl TriggerEvaluator {
     pub fn evaluate(
         trigger: &AITrigger,
         event_type: EventType,
-        current_value: Option<U256>,
+        current_value: Option<i128>,
     ) -> bool {
         // First check if this event type is in the trigger's supported events
         let event_type_matches = trigger.event_types.contains(event_type as u32);
@@ -171,7 +171,7 @@ impl TriggerEvaluator {
         // Evaluate the threshold condition
         let condition = TriggerCondition {
             current_value: value,
-            threshold: trigger.threshold.clone().unwrap(),
+            threshold: trigger.threshold.unwrap(),
             operator: ComparisonOperator::from(trigger.operator.unwrap()),
         };
 
@@ -201,7 +201,7 @@ pub struct AnalysisResult {
     pub latency_ms: u64,
     pub status: u32, // AnalysisStatus as u32
     pub raw_output: Bytes,
-    pub error_message: Option<Symbol>,
+    pub error_message: Symbol,
 }
 
 /// Recommendation generated from AI analysis output
@@ -212,8 +212,8 @@ pub struct Recommendation {
     pub analysis_id: u64,
     pub portfolio_id: Symbol,
     pub action_type: u32, // RecommendationType as u32
-    pub asset: Option<Symbol>,
-    pub amount: Option<U256>,
+    pub asset: Symbol,
+    pub amount: Option<i128>,
     pub confidence_score: u32, // 0-100
     pub timestamp: u64,
     pub accepted: Option<bool>,
@@ -323,7 +323,7 @@ impl RecommendationEngine {
             analysis_id: analysis.analysis_id,
             portfolio_id: analysis.portfolio_id.clone(),
             action_type,
-            asset: None,
+            asset: symbol_short!("none"),
             amount: None,
             confidence_score: confidence,
             timestamp,
@@ -468,7 +468,7 @@ impl EventsContract {
         portfolio_id: Symbol,
         event_type: u32,
         event_data: Bytes,
-        current_value: Option<U256>,
+        current_value: Option<i128>,
     ) -> Result<Vec<u64>, Error> {
         let event = EventType::from(event_type);
         let triggers: Map<Symbol, AITrigger> = env
@@ -515,7 +515,7 @@ impl EventsContract {
                             latency_ms: 0,
                             status: AnalysisStatus::Pending as u32,
                             raw_output: Bytes::new(&env),
-                            error_message: None,
+                            error_message: symbol_short!("none"),
                         };
 
                         analyses.set(analysis_id, analysis);
@@ -585,7 +585,7 @@ impl EventsContract {
             analysis.raw_output = output;
         }
 
-        analysis.error_message = error;
+        analysis.error_message = error.unwrap_or_else(|| symbol_short!("none"));
 
         analyses.set(analysis_id, analysis.clone());
         env.storage()
@@ -676,7 +676,7 @@ impl EventsContract {
         }
 
         analysis.status = AnalysisStatus::TimedOut as u32;
-        analysis.error_message = Some(TIMEOUT);
+        analysis.error_message = TIMEOUT;
 
         analyses.set(analysis_id, analysis);
         env.storage()
@@ -850,12 +850,21 @@ impl EventsContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _, vec, Address, Bytes, Env, U256};
+    use soroban_sdk::{symbol_short, testutils::Address as _, vec, Address, Bytes, Env};
+
+    fn setup(env: &Env) -> EventsContractClient {
+        let id = env.register_contract(None, EventsContract);
+        let client = EventsContractClient::new(env, &id);
+        client.initialize();
+        client
+    }
 
     #[test]
     fn test_initialize() {
         let env = Env::default();
-        let result = EventsContract::initialize(env);
+        let id = env.register_contract(None, EventsContract);
+        let client = EventsContractClient::new(&env, &id);
+        let result = client.initialize();
         assert_eq!(result, OK);
     }
 
@@ -863,7 +872,7 @@ mod tests {
     fn test_add_and_remove_trigger() {
         let env = Env::default();
         env.mock_all_auths();
-        EventsContract::initialize(env.clone());
+        let client = setup(&env);
 
         let owner = Address::generate(&env);
         let trigger_id = symbol_short!("trig001");
@@ -874,10 +883,10 @@ mod tests {
         ];
 
         let trigger = AITrigger {
-            trigger_id,
+            trigger_id: trigger_id.clone(),
             name: symbol_short!("testtrig"),
             event_types,
-            threshold: Some(U256::from_u32(&env, 1000)),
+            threshold: Some(1000),
             operator: Some(ComparisonOperator::GreaterThan as u32),
             ai_service_endpoint: Address::generate(&env),
             timeout: 30000,
@@ -886,20 +895,20 @@ mod tests {
         };
 
         // Add the trigger
-        let result = EventsContract::add_trigger(env.clone(), trigger);
-        assert!(result.is_ok());
+        let result = client.add_trigger(&trigger);
+        assert_eq!(result, OK);
 
         // Verify it was stored
-        let triggers = EventsContract::get_all_triggers(env.clone());
+        let triggers = client.get_all_triggers();
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers.get(0).unwrap().trigger_id, trigger_id);
 
         // Remove the trigger
-        let remove_result = EventsContract::remove_trigger(env.clone(), trigger_id, owner);
-        assert!(remove_result.is_ok());
+        let remove_result = client.remove_trigger(&trigger_id, &owner);
+        assert_eq!(remove_result, OK);
 
         // Verify it was removed
-        let triggers_after = EventsContract::get_all_triggers(env.clone());
+        let triggers_after = client.get_all_triggers();
         assert_eq!(triggers_after.len(), 0);
     }
 
@@ -912,7 +921,7 @@ mod tests {
             trigger_id: symbol_short!("trig001"),
             name: symbol_short!("test"),
             event_types: vec![&env, EventType::PriceThresholdCrossed as u32],
-            threshold: Some(U256::from_u32(&env, 100)),
+            threshold: Some(100),
             operator: Some(ComparisonOperator::GreaterThan as u32),
             ai_service_endpoint: Address::generate(&env),
             timeout: 5000,
@@ -924,7 +933,7 @@ mod tests {
         let should_fire = TriggerEvaluator::evaluate(
             &trigger,
             EventType::PriceThresholdCrossed,
-            Some(U256::from_u32(&env, 150)),
+            Some(150),
         );
         assert!(should_fire);
 
@@ -932,7 +941,7 @@ mod tests {
         let should_not_fire = TriggerEvaluator::evaluate(
             &trigger,
             EventType::PriceThresholdCrossed,
-            Some(U256::from_u32(&env, 50)),
+            Some(50),
         );
         assert!(!should_not_fire);
     }
@@ -942,7 +951,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.budget().reset_unlimited();
-        EventsContract::initialize(env.clone());
+        let client = setup(&env);
 
         let owner = Address::generate(&env);
         let ai_service = Address::generate(&env);
@@ -960,25 +969,23 @@ mod tests {
             owner,
         };
 
-        EventsContract::add_trigger(env.clone(), trigger).unwrap();
+        client.add_trigger(&trigger);
 
         // Process an event that should trigger the analysis
         let portfolio_id = symbol_short!("port001");
         let event_data = Bytes::from_array(&env, &[0x01, 0x02, 0x03]);
-        let analyses = EventsContract::process_event(
-            env.clone(),
-            portfolio_id,
-            EventType::VolatilitySpike as u32,
-            event_data,
-            None,
-        )
-        .unwrap();
+        let analyses = client.process_event(
+            &portfolio_id,
+            &(EventType::VolatilitySpike as u32),
+            &event_data,
+            &None,
+        );
 
         // Should have triggered one analysis
         assert_eq!(analyses.len(), 1);
 
         // Verify the analysis was stored
-        let portfolio_analyses = EventsContract::get_portfolio_analyses(env.clone(), portfolio_id);
+        let portfolio_analyses = client.get_portfolio_analyses(&portfolio_id);
         assert_eq!(portfolio_analyses.len(), 1);
         assert_eq!(
             portfolio_analyses.get(0).unwrap().status,
@@ -991,7 +998,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.budget().reset_unlimited();
-        EventsContract::initialize(env.clone());
+        let client = setup(&env);
 
         let owner = Address::generate(&env);
         let ai_service = Address::generate(&env);
@@ -1008,34 +1015,31 @@ mod tests {
             is_active: true,
             owner,
         };
-        EventsContract::add_trigger(env.clone(), trigger).unwrap();
+        client.add_trigger(&trigger);
 
         // Process event to create analysis
         let portfolio_id = symbol_short!("port001");
-        let analyses = EventsContract::process_event(
-            env.clone(),
-            portfolio_id,
-            EventType::TradeExecuted as u32,
-            Bytes::from_array(&env, &[0x01]),
-            None,
-        )
-        .unwrap();
+        let analyses = client.process_event(
+            &portfolio_id,
+            &(EventType::TradeExecuted as u32),
+            &Bytes::from_array(&env, &[0x01]),
+            &None,
+        );
 
         let analysis_id = analyses.get(0).unwrap();
 
         // Update status to completed
-        let update_result = EventsContract::update_analysis_status(
-            env.clone(),
-            analysis_id,
-            AnalysisStatus::Completed as u32,
-            Some(1500u64),
-            Some(Bytes::from_array(&env, &[0x01, 0x02])),
-            None,
+        let update_result = client.update_analysis_status(
+            &analysis_id,
+            &(AnalysisStatus::Completed as u32),
+            &Some(1500u64),
+            &Some(Bytes::from_array(&env, &[0x01, 0x02])),
+            &None,
         );
-        assert!(update_result.is_ok());
+        assert_eq!(update_result, OK);
 
         // Check metrics were updated
-        let metrics = EventsContract::get_metrics(env.clone());
+        let metrics = client.get_metrics();
         assert_eq!(metrics.total_analyses, 1);
         assert_eq!(metrics.successful_analyses, 1);
         assert_eq!(metrics.average_latency_ms, 1500);
@@ -1046,7 +1050,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.budget().reset_unlimited();
-        EventsContract::initialize(env.clone());
+        let client = setup(&env);
 
         let owner = Address::generate(&env);
         let ai_service = Address::generate(&env);
@@ -1062,38 +1066,36 @@ mod tests {
             is_active: true,
             owner,
         };
-        EventsContract::add_trigger(env.clone(), trigger).unwrap();
+        client.add_trigger(&trigger);
 
         // Create an analysis
         let portfolio_id = symbol_short!("port001");
-        let analyses = EventsContract::process_event(
-            env.clone(),
-            portfolio_id,
-            EventType::LiquidityChange as u32,
-            Bytes::from_array(&env, &[0x01]),
-            None,
-        )
-        .unwrap();
+        let analyses = client.process_event(
+            &portfolio_id,
+            &(EventType::LiquidityChange as u32),
+            &Bytes::from_array(&env, &[0x01]),
+            &None,
+        );
 
         let analysis_id = analyses.get(0).unwrap();
 
         // Process timeout
-        let timeout_result = EventsContract::process_timeout(env.clone(), analysis_id);
-        assert!(timeout_result.is_ok());
+        let timeout_result = client.process_timeout(&analysis_id);
+        assert_eq!(timeout_result, OK);
 
         // Verify analysis is marked as timed out
-        let portfolio_analyses = EventsContract::get_portfolio_analyses(env.clone(), portfolio_id);
+        let portfolio_analyses = client.get_portfolio_analyses(&portfolio_id);
         assert_eq!(
             portfolio_analyses.get(0).unwrap().status,
             AnalysisStatus::TimedOut as u32
         );
         assert_eq!(
             portfolio_analyses.get(0).unwrap().error_message,
-            Some(TIMEOUT)
+            TIMEOUT
         );
 
         // Check metrics
-        let metrics = EventsContract::get_metrics(env.clone());
+        let metrics = client.get_metrics();
         assert_eq!(metrics.timed_out_analyses, 1);
     }
 
@@ -1101,15 +1103,16 @@ mod tests {
     fn test_subscribe_unsubscribe() {
         let env = Env::default();
         env.mock_all_auths();
+        let client = setup(&env);
         let portfolio_id = symbol_short!("port001");
         let subscriber = Address::generate(&env);
 
         // Subscribe
-        let sub_result = EventsContract::subscribe(env.clone(), portfolio_id, subscriber.clone());
-        assert!(sub_result.is_ok());
+        let sub_result = client.subscribe(&portfolio_id, &subscriber);
+        assert_eq!(sub_result, OK);
 
         // Unsubscribe
-        let unsub_result = EventsContract::unsubscribe(env.clone(), portfolio_id, subscriber);
-        assert!(unsub_result.is_ok());
+        let unsub_result = client.unsubscribe(&portfolio_id, &subscriber);
+        assert_eq!(unsub_result, OK);
     }
 }

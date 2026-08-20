@@ -8,7 +8,8 @@
 
 use alloc::format;
 use alloc::string::String as RustString;
-use soroban_sdk::{Env, String, Vec};
+use alloc::string::ToString;
+use soroban_sdk::{Env, FromVal, String, Symbol, Vec};
 
 use crate::records::{AuditEventType, AuditLog};
 
@@ -17,18 +18,34 @@ use crate::records::{AuditEventType, AuditLog};
 pub const CSV_HEADER: &str =
     "seq,timestamp,event_type,actor,permissions,portfolio,outcome,detail";
 
+fn to_rust_str(s: &String) -> RustString {
+    let len = s.len() as usize;
+    if len == 0 {
+        return RustString::new();
+    }
+    let mut buf = [0u8; 256];
+    let slice_len = len.min(256);
+    s.copy_into_slice(&mut buf[..slice_len]);
+    RustString::from_utf8(buf[..slice_len].to_vec()).unwrap_or_default()
+}
+
+fn symbol_to_rust_str(env: &Env, s: &Symbol) -> RustString {
+    let soroban_str = String::from_val(env, &s.to_val());
+    to_rust_str(&soroban_str)
+}
+
 /// One JSON object per `AuditLog` (no surrounding array).
 pub fn format_json_entry(env: &Env, entry: &AuditLog) -> String {
     let rs: RustString = format!(
-        "{{\"seq\":{},\"timestamp\":{},\"event_type\":\"{}\",\"actor\":\"{}\",\"permissions\":{},\"portfolio\":\"{}\",\"outcome\":\"{}\",\"detail\":\"{}\"}}",
+        "{{\"seq\":{},\"timestamp\":{},\"event_type\":\"{}\",\"actor\":\"{:?}\",\"permissions\":{},\"portfolio\":\"{:?}\",\"outcome\":\"{:?}\",\"detail\":\"{}\"}}",
         entry.seq,
         entry.timestamp,
         event_type_name(entry.event_type),
-        entry.actor.to_string(),
+        entry.actor,
         entry.permissions,
-        entry.portfolio.to_string(),
-        entry.outcome.to_string(),
-        json_escape(&entry.detail.to_string()),
+        entry.portfolio,
+        entry.outcome,
+        json_escape(&to_rust_str(&entry.detail)),
     );
     String::from_str(env, &rs)
 }
@@ -36,15 +53,15 @@ pub fn format_json_entry(env: &Env, entry: &AuditLog) -> String {
 /// One CSV row matching [`CSV_HEADER`].
 pub fn format_csv_row(env: &Env, entry: &AuditLog) -> String {
     let rs: RustString = format!(
-        "{},{},{},{},{},{},{},{}",
+        "{},{},{},{:?},{},{:?},{:?},{}",
         entry.seq,
         entry.timestamp,
         event_type_name(entry.event_type),
-        entry.actor.to_string(),
+        entry.actor,
         entry.permissions,
-        entry.portfolio.to_string(),
-        entry.outcome.to_string(),
-        csv_escape(&entry.detail.to_string()),
+        entry.portfolio,
+        entry.outcome,
+        csv_escape(&to_rust_str(&entry.detail)),
     );
     String::from_str(env, &rs)
 }
