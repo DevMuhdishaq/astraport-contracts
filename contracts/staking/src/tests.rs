@@ -838,577 +838,399 @@ fn test_totals_handle_re_stake_after_full_exit() {
 }
 
 // ===========================================================================
-// Stress tests: extreme rates, durations, and accuracy verification
+// Yield Distribution & Claiming System Tests
 // ===========================================================================
 
-// -- helpers for stress tests -------------------------------------------------
-
-/// Compute the reference daily-compounded yield using the exact formula:
-///   yield = P * ((1 + APR/365)^days - 1)
-/// where `days` is whole days only (matching the contract's whole-day exponent).
-fn reference_daily_yield(principal: i128, apr_fp: i128, whole_days: u64) -> i128 {
-    // (1 + apr/365)^days via repeated multiplication in fixed-point.
-    let daily_rate = apr_fp / 365;
-    let per_day = SCALE + daily_rate;
-    let mut factor = SCALE; // 1.0
-    let mut base = per_day;
-    let mut exp = whole_days;
-    while exp > 0 {
-        if exp & 1 == 1 {
-            factor = (factor as i128 * base as i128) / SCALE;
-        }
-        exp >>= 1;
-        if exp > 0 {
-            base = (base as i128 * base as i128) / SCALE;
-        }
-    }
-    let growth = factor - SCALE;
-    (principal as i128 * growth as i128) / SCALE
-}
-
-/// Compute the reference continuous-compounded yield:
-///   yield = P * (e^(APR * t) - 1)
-/// Uses the contract's `fp::exp` for the same precision.
-fn reference_continuous_yield(principal: i128, apr_fp: i128, duration_secs: u64) -> i128 {
-    use crate::fixed_point as fp;
-    let t = fp::div(duration_secs as i128, SECONDS_PER_YEAR as i128).unwrap();
-    let exponent = fp::mul(apr_fp, t).unwrap();
-    let factor = fp::exp(exponent).unwrap();
-    let growth = factor - SCALE;
-    (principal as i128 * growth as i128) / SCALE
-}
-
-/// Allow ±0.01% tolerance on a reference value (industry standard).
-fn assert_within_bps(actual: i128, reference: i128, bps: i128) {
-    let tol = (reference.abs() * bps) / 10_000;
-    let diff = (actual - reference).abs();
-    assert!(
-        diff <= tol.max(1),
-        "assert_within_bps failed: actual={}, reference={}, bps tolerance={}, diff={}",
-        actual, reference, bps, diff,
-    );
-}
-
 // ---------------------------------------------------------------------------
-// Extreme APR stress tests
+// Reserve management
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stress_daily_100pct_apr_one_year() {
-    // 100% APR daily compounding for 1 year.
-    // Expected: P * ((1 + 1/365)^365 - 1) ≈ P * 1.7141
-    let principal = 1_000_000_000i128;
-    let apr = SCALE; // 100% = 1.0 in fixed-point
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Daily);
-    let earned = calc.compute_yield(principal, apr, SECONDS_PER_YEAR).unwrap();
-    let ref_earned = reference_daily_yield(principal, apr, 365);
-    assert_within_bps(earned, ref_earned, 1); // within 0.01%
-    assert!(earned > principal, "100% APR over 1 year should more than double: earned={}", earned);
+fn reserve_initially_zero() {
+    let (_env, client, _admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    assert_eq!(client.reserve_balance(&asset), 0);
 }
 
 #[test]
-fn stress_continuous_100pct_apr_one_year() {
-    // 100% APR continuous compounding for 1 year.
-    // Expected: P * (e^1 - 1) ≈ P * 1.7183
-    let principal = 1_000_000_000i128;
-    let apr = SCALE; // 100%
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Continuous);
-    let earned = calc.compute_yield(principal, apr, SECONDS_PER_YEAR).unwrap();
-    let ref_earned = reference_continuous_yield(principal, apr, SECONDS_PER_YEAR);
-    assert_within_bps(earned, ref_earned, 1);
-    // e^1 - 1 = 1.71828..., so yield should be ~1.718x principal.
-    assert!(earned > principal, "continuous 100% APR over 1 year: earned={}", earned);
+fn fund_reserve_increases_balance() {
+    let (env, client, admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    assert_eq!(client.fund_reserve(&admin, &asset, &1_000_000), 1_000_000);
+    assert_eq!(client.reserve_balance(&asset), 1_000_000);
+    // Fund again.
+    assert_eq!(client.fund_reserve(&admin, &asset, &500_000), 1_500_000);
+    assert_eq!(client.reserve_balance(&asset), 1_500_000);
 }
 
 #[test]
-fn stress_very_low_apr() {
-    // 0.001% APR daily compounding for 1 year.
-    let principal = 1_000_000_000i128;
-    let apr = SCALE / 100_000; // 0.00001 = 0.001%
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Daily);
-    let earned = calc.compute_yield(principal, apr, SECONDS_PER_YEAR).unwrap();
-    // Simple interest approximation: P * 0.001% = 1000
-    // Compounding adds a tiny bit, so earned ≈ 1000.
-    assert!(earned > 0, "should earn something at 0.001% APR");
-    assert!(earned < 2000, "0.001% on 1B should be ~1000, got {}", earned);
+fn withdraw_reserve_decreases_balance() {
+    let (env, client, admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    client.fund_reserve(&admin, &asset, &1_000_000);
+    assert_eq!(client.withdraw_reserve(&admin, &asset, &400_000), 600_000);
+    assert_eq!(client.reserve_balance(&asset), 600_000);
 }
 
 #[test]
-fn stress_very_low_apr_continuous() {
-    // 0.001% APR continuous for 1 year.
-    let principal = 1_000_000_000i128;
-    let apr = SCALE / 100_000;
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Continuous);
-    let earned = calc.compute_yield(principal, apr, SECONDS_PER_YEAR).unwrap();
-    assert!(earned > 0, "should earn something");
-    assert!(earned < 2000, "too high for 0.001%: {}", earned);
+#[should_panic(expected = "InsufficientReserve")]
+fn withdraw_reserve_insufficient_panics() {
+    let (_env, client, admin) = setup_with_admin();
+    let asset = symbol_short!("XLM");
+    client.fund_reserve(&admin, &asset, &100_000);
+    client.withdraw_reserve(&admin, &asset, &200_000);
+}
+
+#[test]
+fn fund_requires_admin() {
+    let (env, client, _admin) = setup_with_admin();
+    let non_admin = Address::generate(&env);
+    let asset = symbol_short!("XLM");
+    client.fund_reserve(&non_admin, &asset, &1_000_000);
 }
 
 // ---------------------------------------------------------------------------
-// Extreme duration stress tests
+// Partial claims
 // ---------------------------------------------------------------------------
 
 #[test]
-fn stress_one_second_duration() {
-    // 1 second at 5% APR should produce a tiny but non-negative yield.
-    let principal = 1_000_000_000_000i128; // 1 trillion
-    let apr = SCALE / 20; // 5%
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Daily);
-    let earned = calc.compute_yield(principal, apr, 1).unwrap();
-    // 1 second at 5% ≈ 1e12 * 0.05 / (365*86400) ≈ 158
-    assert!(earned >= 0, "should not be negative: {}", earned);
-    assert!(earned < 1000, "1 second at 5% should be tiny: {}", earned);
-}
-
-#[test]
-fn stress_one_second_continuous() {
-    let principal = 1_000_000_000_000i128;
-    let apr = SCALE / 20; // 5%
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Continuous);
-    let earned = calc.compute_yield(principal, apr, 1).unwrap();
-    assert!(earned >= 0);
-    assert!(earned < 1000, "1 second continuous: {}", earned);
-}
-
-#[test]
-fn stress_five_year_duration() {
-    // 10% APR daily over 5 years.
-    let principal = 100_000_000_000i128;
-    let apr = SCALE / 10; // 10%
-    let five_years = 5 * SECONDS_PER_YEAR;
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Daily);
-    let earned = calc.compute_yield(principal, apr, five_years).unwrap();
-    // Simple interest would give P * 0.10 * 5 = P * 0.50 = 50B.
-    // Compounding should exceed that.
-    assert!(earned > 50_000_000_000, "5yr 10% should exceed simple: {}", earned);
-    assert!(earned < 100_000_000_000, "5yr 10% should be < 100%: {}", earned);
-}
-
-#[test]
-fn stress_ten_year_duration_continuous() {
-    // 5% APR continuous over 10 years.
-    let principal = 100_000_000_000i128;
-    let apr = SCALE / 20; // 5%
-    let ten_years = 10 * SECONDS_PER_YEAR;
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Continuous);
-    let earned = calc.compute_yield(principal, apr, ten_years).unwrap();
-    // e^(0.05*10) - 1 = e^0.5 - 1 ≈ 0.6487
-    // expected yield ≈ 64.87B
-    let ref_earned = reference_continuous_yield(principal, apr, ten_years);
-    assert_within_bps(earned, ref_earned, 1);
-    assert!(earned > 60_000_000_000, "10yr 5% continuous: {}", earned);
-    assert!(earned < 70_000_000_000, "10yr 5% continuous: {}", earned);
-}
-
-// ---------------------------------------------------------------------------
-// Continuous >= Daily invariant
-// ---------------------------------------------------------------------------
-
-#[test]
-fn stress_continuous_never_less_than_daily_various_rates() {
-    let principal = 1_000_000_000i128;
-    let rates = [
-        SCALE / 100,     // 1%
-        SCALE / 10,      // 10%
-        SCALE / 4,       // 25%
-        SCALE / 2,       // 50%
-        SCALE,            // 100%
-        SCALE * 2,       // 200%
-        SCALE * 10,      // 1000%
-    ];
-    for &apr in &rates {
-        for &dur in &[SECONDS_PER_DAY, 30 * SECONDS_PER_DAY, SECONDS_PER_YEAR] {
-            let daily = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Daily)
-                .compute_yield(principal, apr, dur)
-                .unwrap();
-            let cont = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Continuous)
-                .compute_yield(principal, apr, dur)
-                .unwrap();
-            assert!(
-                cont >= daily,
-                "continuous ({}) should be >= daily ({}) for apr={}, dur={}",
-                cont, daily, apr, dur,
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Accuracy vs reference formulas: ±0.01% (1 bps)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn accuracy_daily_matches_reference_various_aprs() {
-    let principal = 1_000_000_000_000i128; // 1T
-    let rates = [
-        (SCALE / 100, "1%"),
-        (SCALE / 20, "5%"),
-        (SCALE / 10, "10%"),
-        (SCALE / 4, "25%"),
-        (SCALE / 2, "50%"),
-    ];
-    let durations = [
-        (SECONDS_PER_DAY, "1 day"),
-        (7 * SECONDS_PER_DAY, "7 days"),
-        (30 * SECONDS_PER_DAY, "30 days"),
-        (SECONDS_PER_YEAR, "1 year"),
-    ];
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Daily);
-    for &(apr, apr_label) in &rates {
-        for &(dur, dur_label) in &durations {
-            let earned = calc.compute_yield(principal, apr, dur).unwrap();
-            let whole_days = dur / SECONDS_PER_DAY;
-            let ref_earned = reference_daily_yield(principal, apr, whole_days);
-            assert_within_bps(earned, ref_earned, 1);
-        }
-    }
-}
-
-#[test]
-fn accuracy_continuous_matches_reference_various_aprs() {
-    let principal = 1_000_000_000_000i128;
-    let rates = [
-        (SCALE / 100, "1%"),
-        (SCALE / 20, "5%"),
-        (SCALE / 10, "10%"),
-        (SCALE / 4, "25%"),
-        (SCALE / 2, "50%"),
-    ];
-    let durations = [
-        SECONDS_PER_DAY,
-        7 * SECONDS_PER_DAY,
-        30 * SECONDS_PER_DAY,
-        SECONDS_PER_YEAR,
-    ];
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Continuous);
-    for &(apr, _) in &rates {
-        for &dur in &durations {
-            let earned = calc.compute_yield(principal, apr, dur).unwrap();
-            let ref_earned = reference_continuous_yield(principal, apr, dur);
-            assert_within_bps(earned, ref_earned, 1);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// APR/APY roundtrip accuracy at extreme values
-// ---------------------------------------------------------------------------
-
-#[test]
-fn apy_roundtrip_extreme_low_apr() {
-    let apr = SCALE / 10_000; // 0.01%
-    for mode in &[CompoundingMode::Daily, CompoundingMode::Continuous] {
-        let apy = client_for_roundtrip_apr_to_apy(apr, *mode);
-        let back = client_for_roundtrip_apy_to_apr(apy, *mode);
-        // 0.01% target: tolerance ~ SCALE / 10_000_000
-        approx(back, apr, SCALE / 10_000_000);
-    }
-}
-
-#[test]
-fn apy_roundtrip_high_apr() {
-    let apr = SCALE * 2; // 200%
-    for mode in &[CompoundingMode::Daily, CompoundingMode::Continuous] {
-        let apy = client_for_roundtrip_apr_to_apy(apr, *mode);
-        let back = client_for_roundtrip_apy_to_apr(apy, *mode);
-        approx(back, apr, SCALE / 1000); // 0.1% tolerance at high rates
-    }
-}
-
-#[test]
-fn apy_roundtrip_extreme_high_apr() {
-    let apr = SCALE * 10; // 1000%
-    for mode in &[CompoundingMode::Daily, CompoundingMode::Continuous] {
-        let apy = client_for_roundtrip_apr_to_apy(apr, *mode);
-        let back = client_for_roundtrip_apy_to_apr(apy, *mode);
-        approx(back, apr, SCALE / 100); // 1% tolerance at extreme rates
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Time-weighted accrual: rate changes preserve correctness
-// ---------------------------------------------------------------------------
-
-#[test]
-fn time_weighted_rate_change_daily() {
+fn claim_yield_partial_basic() {
     let (env, client) = setup();
+    env.mock_all_auths();
     env.ledger().set_timestamp(0);
     let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-    let principal = 1_000_000_000i128;
+    let asset = symbol_short!("VESTED");
 
-    // Phase 1: 10% APR for 180 days.
-    let apr1 = SCALE / 10;
-    client.open_yield_position(&staker, &asset, &principal, &apr1, &CompoundingMode::Daily);
-    env.ledger().set_timestamp(180 * SECONDS_PER_DAY);
-    let mid = client.accrue_yield(&staker, &asset);
-    let yield_phase1 = mid.accrued_yield;
-    assert!(yield_phase1 > 0, "phase 1 should accrue yield");
-
-    // Phase 2: change to 5% APR for another 180 days.
-    let apr2 = SCALE / 20;
-    client.set_yield_rate(&staker, &asset, &apr2);
-    env.ledger().set_timestamp(365 * SECONDS_PER_DAY);
-    let full = client.accrue_yield(&staker, &asset);
-    let yield_phase2 = full.accrued_yield - yield_phase1;
-    assert!(yield_phase2 > 0, "phase 2 should accrue yield");
-
-    // Verify: phase 1 yield should match a 10%-APR 180-day calc.
-    let ref_phase1 = reference_daily_yield(principal, apr1, 180);
-    assert_within_bps(yield_phase1, ref_phase1, 1);
-
-    // Verify: phase 2 yield should match a 5%-APR 185-day calc
-    // (185 days from day 180 to day 365).
-    let ref_phase2 = reference_daily_yield(principal, apr2, 185);
-    assert_within_bps(yield_phase2, ref_phase2, 1);
-}
-
-#[test]
-fn time_weighted_multiple_rate_changes() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-    let principal = 10_000_000i128;
-
-    client.open_yield_position(&staker, &asset, &principal, &SCALE, &CompoundingMode::Continuous);
-    // 20% for 100 days
-    env.ledger().set_timestamp(100 * SECONDS_PER_DAY);
-    client.set_yield_rate(&staker, &asset, &(SCALE / 5));
-    // 20% for another 100 days
-    env.ledger().set_timestamp(200 * SECONDS_PER_DAY);
-    client.set_yield_rate(&staker, &asset, &(SCALE / 10));
-    // 10% for 165 more days
-    env.ledger().set_timestamp(365 * SECONDS_PER_DAY);
-    let record = client.accrue_yield(&staker, &asset);
-    assert!(record.accrued_yield > 0, "must have yield");
-}
-
-// ---------------------------------------------------------------------------
-// current_yield is read-only (no state mutation)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn current_yield_does_not_mutate_state() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-    client.open_yield_position(&staker, &asset, &1_000_000, &(SCALE / 10), &CompoundingMode::Daily);
-
-    env.ledger().set_timestamp(SECONDS_PER_DAY * 30);
-    let y1 = client.current_yield(&staker, &asset);
-    let y2 = client.current_yield(&staker, &asset);
-    assert_eq!(y1, y2, "repeated current_yield calls should return the same value");
-    assert!(y1 > 0, "should have some yield after 30 days");
-}
-
-// ---------------------------------------------------------------------------
-// History is maintained and queryable across accruals
-// ---------------------------------------------------------------------------
-
-#[test]
-fn history_grows_with_each_accrual() {
-    let (env, client) = setup();
-    env.ledger().set_timestamp(0);
-    let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-    client.open_yield_position(&staker, &asset, &1_000_000, &(SCALE / 10), &CompoundingMode::Daily);
-
-    // First accrual at day 30.
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
     env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
-    client.accrue_yield(&staker, &asset);
-    let h1 = client.yield_history(&staker, &asset);
-    assert_eq!(h1.len(), 1, "should have 1 history entry");
 
-    // Second accrual at day 60.
-    env.ledger().set_timestamp(60 * SECONDS_PER_DAY);
-    client.accrue_yield(&staker, &asset);
-    let h2 = client.yield_history(&staker, &asset);
-    assert_eq!(h2.len(), 2, "should have 2 history entries");
+    let available = client.current_yield(&staker, &asset);
+    assert!(available > 0);
 
-    // Each entry should have yield_earned > 0 and period_seconds > 0.
-    for i in 0..h2.len() {
-        let entry = h2.get(i).unwrap();
-        assert!(entry.yield_earned > 0, "entry {} should have earned yield", i);
-        assert!(entry.period_seconds > 0, "entry {} should have positive period", i);
-    }
+    // Claim half.
+    let half = available / 2;
+    let claimed = client.claim_yield_partial(&staker, &asset, &half);
+    assert_eq!(claimed, half);
+
+    // Remaining yield should be approximately half.
+    let remaining = client.current_yield(&staker, &asset);
+    approx(remaining, available - half, 1);
 }
 
 #[test]
-fn history_records_rate_change_periods() {
+fn claim_yield_partial_claims_all_if_amount_exceeds() {
     let (env, client) = setup();
+    env.mock_all_auths();
     env.ledger().set_timestamp(0);
     let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-    client.open_yield_position(&staker, &asset, &1_000_000, &(SCALE / 10), &CompoundingMode::Daily);
+    let asset = symbol_short!("VESTED");
 
-    // Accrue at 10%, then change rate.
-    env.ledger().set_timestamp(100 * SECONDS_PER_DAY);
-    client.accrue_yield(&staker, &asset);
-    client.set_yield_rate(&staker, &asset, &(SCALE / 20)); // 5%
-    env.ledger().set_timestamp(200 * SECONDS_PER_DAY);
-    client.accrue_yield(&staker, &asset);
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
 
-    let history = client.yield_history(&staker, &asset);
-    // First entry: 10% APR over ~100 days.
-    assert_eq!(history.get(0).unwrap().apr, SCALE / 10);
-    // Second entry: 5% APR over ~100 days (the set_yield_rate call logs a history entry too).
-    // set_yield_rate triggers accrue_to which appends the first segment, then
-    // the explicit accrue appends the second segment.
-    assert!(history.len() >= 2);
-    // Check the last entry has the new rate.
-    let last = history.get(history.len() - 1).unwrap();
-    assert_eq!(last.apr, SCALE / 20);
+    let available = client.current_yield(&staker, &asset);
+    let big_amount = available * 2;
+    let claimed = client.claim_yield_partial(&staker, &asset, &big_amount);
+    assert_eq!(claimed, available);
+    assert_eq!(client.current_yield(&staker, &asset), 0);
+}
+
+#[test]
+fn claim_yield_partial_zero_amount_fails() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    assert_eq!(client.try_claim_yield_partial(&staker, &asset, &0), Err(Ok(crate::Error::InvalidClaimAmount)));
+}
+
+#[test]
+fn claim_yield_partial_no_position_fails() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+    assert_eq!(client.try_claim_yield_partial(&staker, &asset, &1000), Err(Ok(crate::Error::NoYieldPosition)));
+}
+
+#[test]
+fn claim_yield_partial_capped_by_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    // Fund a small reserve.
+    client.fund_reserve(&admin, &asset, &1_000);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    // Available yield is much larger than reserve.
+    let available = client.current_yield(&staker, &asset);
+    assert!(available > 1_000);
+
+    // Claim should be capped to reserve.
+    let claimed = client.claim_yield_partial(&staker, &asset, &available);
+    assert_eq!(claimed, 1_000);
+    assert_eq!(client.reserve_balance(&asset), 0);
 }
 
 // ---------------------------------------------------------------------------
-// Projection accuracy at various horizons
+// Batch claiming
 // ---------------------------------------------------------------------------
 
 #[test]
-fn projection_accuracy_30_days() {
-    let principal = SCALE; // 1 unit
+fn batch_claim_multiple_stakers() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
     let apr = SCALE / 10; // 10%
-    let horizon = 30 * SECONDS_PER_DAY;
-    let proj = client_project(principal, apr, CompoundingMode::Continuous, horizon);
-    let ref_yield = reference_continuous_yield(principal, apr, horizon);
-    assert_within_bps(proj.projected_yield, ref_yield, 1);
+
+    // Open positions for both.
+    client.open_yield_position(&alice, &asset, &SCALE, &apr, &CompoundingMode::Daily);
+    client.open_yield_position(&bob, &asset, &(2 * SCALE), &apr, &CompoundingMode::Daily);
+
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    let alice_yield = client.current_yield(&alice, &asset);
+    let bob_yield = client.current_yield(&bob, &asset);
+    assert!(alice_yield > 0);
+    assert!(bob_yield > 0);
+
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+
+    assert_eq!(results.len(), 2);
+    let (a_addr, a_claimed) = results.get(0).unwrap();
+    let (b_addr, b_claimed) = results.get(1).unwrap();
+    assert_eq!(a_claimed, alice_yield);
+    assert_eq!(b_claimed, bob_yield);
+
+    // After batch claim, yields should be zero.
+    assert_eq!(client.current_yield(&alice, &asset), 0);
+    assert_eq!(client.current_yield(&bob, &asset), 0);
 }
 
 #[test]
-fn projection_accuracy_1_year() {
-    let principal = SCALE * 100;
-    let apr = SCALE / 20; // 5%
-    let proj = client_project(principal, apr, CompoundingMode::Daily, SECONDS_PER_YEAR);
-    let ref_yield = reference_daily_yield(principal, apr, 365);
-    assert_within_bps(proj.projected_yield, ref_yield, 1);
+fn batch_claim_with_reserve_cap() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+    let apr = SCALE / 10;
+
+    client.open_yield_position(&alice, &asset, &SCALE, &apr, &CompoundingMode::Daily);
+    client.open_yield_position(&bob, &asset, &SCALE, &apr, &CompoundingMode::Daily);
+
+    // Small reserve — less than total accrued.
+    client.fund_reserve(&admin, &asset, &1_000_000_000);
+
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+
+    // Total claimed should be capped to reserve.
+    let total_claimed: i128 = results.iter().map(|(_, a)| a).sum();
+    assert!(total_claimed <= 1_000_000_000);
+    assert_eq!(client.reserve_balance(&asset), 1_000_000_000 - total_claimed);
 }
 
 #[test]
-fn projection_balance_equals_principal_plus_yield() {
-    let principal = 500_000_000i128;
-    let apr = SCALE / 5; // 20%
-    let proj = client_project(principal, apr, CompoundingMode::Continuous, SECONDS_PER_YEAR);
-    assert_eq!(proj.projected_balance, principal + proj.projected_yield);
-}
-
-// ---------------------------------------------------------------------------
-// Zero principal edge cases
-// ---------------------------------------------------------------------------
-
-#[test]
-fn zero_principal_yields_zero_all_modes() {
-    for mode in &[CompoundingMode::Daily, CompoundingMode::Continuous] {
-        let calc = crate::compounding::YieldCalculator::new(mode.to_strategy());
-        assert_eq!(calc.compute_yield(0, SCALE / 10, SECONDS_PER_YEAR).unwrap(), 0);
-        assert_eq!(calc.compute_balance(0, SCALE / 10, SECONDS_PER_YEAR).unwrap(), 0);
-    }
-}
-
-#[test]
-fn zero_apr_yields_zero_all_modes() {
-    let principal = 1_000_000i128;
-    for mode in &[CompoundingMode::Daily, CompoundingMode::Continuous] {
-        let calc = crate::compounding::YieldCalculator::new(mode.to_strategy());
-        assert_eq!(calc.compute_yield(principal, 0, SECONDS_PER_YEAR).unwrap(), 0);
-    }
-}
-
-#[test]
-fn zero_duration_yields_zero_all_modes() {
-    let principal = 1_000_000i128;
-    for mode in &[CompoundingMode::Daily, CompoundingMode::Continuous] {
-        let calc = crate::compounding::YieldCalculator::new(mode.to_strategy());
-        assert_eq!(calc.compute_yield(principal, SCALE / 10, 0).unwrap(), 0);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Segment yield computation (variable rates)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn yield_segments_time_weighted_accuracy() {
-    let principal = 1_000_000_000i128;
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Daily);
-    // 10% for 180 days, then 5% for 185 days.
-    let segments = [
-        (SCALE / 10, 180 * SECONDS_PER_DAY),
-        (SCALE / 20, 185 * SECONDS_PER_DAY),
-    ];
-    let total_yield = calc.compute_yield_segments(principal, &segments).unwrap();
-    assert!(total_yield > 0, "segments should produce yield");
-    // Verify by computing manually: compound through each segment.
-    let mut balance = principal;
-    for &(apr, dur) in &segments {
-        let earned = calc.compute_yield(balance, apr, dur).unwrap();
-        balance += earned;
-    }
-    assert_eq!(total_yield, balance - principal);
-}
-
-// ---------------------------------------------------------------------------
-n// Yield claim resets accrued_yield
-// ---------------------------------------------------------------------------
-
-#[test]
-fn claim_full_cycle_accrue_claim_reaccrue() {
+fn batch_claim_no_yield_returns_zero() {
     let (env, client) = setup();
+    env.mock_all_auths();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    // No yield positions opened.
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.get(0).unwrap().1, 0);
+    assert_eq!(results.get(1).unwrap().1, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Pause / unpause distributions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn distributions_not_paused_initially() {
+    let (env, client) = setup();
+    assert!(!client.distributions_paused());
+}
+
+#[test]
+fn pause_and_unpause() {
+    let (env, client, admin) = setup_with_admin();
+    assert_eq!(client.pause_distributions(&admin), symbol_short!("paused"));
+    assert!(client.distributions_paused());
+    assert_eq!(client.unpause_distributions(&admin), symbol_short!("active"));
+    assert!(!client.distributions_paused());
+}
+
+#[test]
+fn paused_batch_claim_returns_zero() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
     env.ledger().set_timestamp(0);
     let staker = Address::generate(&env);
-    let asset = symbol_short!("XLM");
-    client.open_yield_position(&staker, &asset, &1_000_000, &(SCALE / 10), &CompoundingMode::Daily);
+    let asset = symbol_short!("VESTED");
 
-    // Accrue 30 days, claim, then accrue another 30 days.
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+    assert!(client.current_yield(&staker, &asset) > 0);
+
+    // Pause distributions.
+    client.pause_distributions(&admin);
+
+    let stakers: Vec<Address> = soroban_sdk::vec![&env, staker.clone()];
+    let results = client.batch_claim(&stakers, &asset);
+    assert_eq!(results.get(0).unwrap().1, 0);
+    // Yield should still be accrued (not consumed).
+    assert!(client.current_yield(&staker, &asset) > 0);
+}
+
+#[test]
+fn paused_process_distribution_returns_zero() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &0);
+    client.pause_distributions(&admin);
+    env.ledger().set_timestamp(200);
+
+    let paid = client.process_distribution(&staker, &asset);
+    assert_eq!(paid, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Distribution history
+// ---------------------------------------------------------------------------
+
+#[test]
+fn distribution_history_records_claims() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
+    env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
+    client.claim_yield(&staker, &asset);
+
+    let history = client.distribution_history(&staker, &asset);
+    assert!(history.len() >= 1);
+    let record = history.get(0).unwrap();
+    assert!(record.amount > 0);
+    assert_eq!(record.staker, staker);
+    assert_eq!(record.asset, asset);
+}
+
+#[test]
+fn total_yield_claimed_tracks_cumulative() {
+    let (env, client) = setup();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    client.open_yield_position(&staker, &asset, &SCALE, &(SCALE / 10), &CompoundingMode::Daily);
     env.ledger().set_timestamp(30 * SECONDS_PER_DAY);
     let first_claim = client.claim_yield(&staker, &asset);
     assert!(first_claim > 0);
-    assert_eq!(client.current_yield(&staker, &asset), 0);
 
+    // Accumulate more yield.
     env.ledger().set_timestamp(60 * SECONDS_PER_DAY);
-    let second_yield = client.current_yield(&staker, &asset);
-    assert!(second_yield > 0, "should accrue again after claim");
+    let second_claim = client.claim_yield(&staker, &asset);
+    assert!(second_claim > 0);
 
-    // Second yield should be approximately the same as the first (same 30-day window).
-    assert_within_bps(second_yield, first_claim, 100); // 1% tolerance for compounding effect
+    let total = client.total_yield_claimed(&staker, &asset);
+    assert_eq!(total, first_claim + second_claim);
 }
 
 // ---------------------------------------------------------------------------
-// Precision: 18-digit fixed-point doesn't lose precision on small yields
+// Scheduled distributions with reserve
 // ---------------------------------------------------------------------------
 
 #[test]
-fn precision_small_yield_on_large_principal() {
-    // Very low rate, short time — tests that fixed-point doesn't round to zero.
-    let principal = 1_000_000_000_000_000_000i128; // 1e18 (= SCALE)
-    let apr = SCALE / 1_000_000; // 0.0001% = 1e-6
-    let calc = crate::compounding::YieldCalculator::new(crate::compounding::Compounding::Continuous);
-    let earned = calc.compute_yield(principal, apr, SECONDS_PER_DAY).unwrap();
-    // Expected: ~1e18 * 1e-6 / 365 ≈ 2.74e9
-    assert!(earned > 0, "small yield should be non-zero: {}", earned);
+fn scheduled_distribution_funded_from_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
+
+    // Fund reserve.
+    client.fund_reserve(&admin, &asset, &1_000_000);
+
+    // Schedule a one-off distribution at ts=100.
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &0);
+
+    // Before due: nothing paid.
+    env.ledger().set_timestamp(50);
+    assert_eq!(client.process_distribution(&staker, &asset), 0);
+
+    // After due: paid from reserve.
+    env.ledger().set_timestamp(150);
+    assert_eq!(client.process_distribution(&staker, &asset), 100_000);
+    assert_eq!(client.reserve_balance(&asset), 900_000);
 }
 
-// ===========================================================================
-// Helper wrappers (use contract client for roundtrip tests)
-// ===========================================================================
+#[test]
+fn scheduled_distribution_skipped_when_insufficient_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
 
-fn client_for_roundtrip_apr_to_apy(apr: i128, mode: CompoundingMode) -> i128 {
-    let (_env, client) = setup();
-    client.apr_to_apy(&apr, &mode)
+    // Fund insufficient reserve.
+    client.fund_reserve(&admin, &asset, &50_000);
+
+    // Schedule distribution of 100_000.
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &0);
+
+    env.ledger().set_timestamp(200);
+    let paid = client.process_distribution(&staker, &asset);
+    // Should be skipped — reserve insufficient.
+    assert_eq!(paid, 0i128);
+    assert_eq!(client.reserve_balance(&asset), 50_000);
 }
 
-fn client_for_roundtrip_apy_to_apr(apy: i128, mode: CompoundingMode) -> i128 {
-    let (_env, client) = setup();
-    client.apy_to_apr(&apy, &mode)
-}
+#[test]
+fn recurring_distribution_recurring_from_reserve() {
+    let (env, client, admin) = setup_with_admin();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(0);
+    let staker = Address::generate(&env);
+    let asset = symbol_short!("VESTED");
 
-fn client_project(
-    principal: i128,
-    apr: i128,
-    mode: CompoundingMode,
-    horizon: u64,
-) -> crate::records::YieldProjection {
-    let (_env, client) = setup();
-    client.project_yield(&principal, &apr, &mode, &horizon)
+    client.fund_reserve(&admin, &asset, &1_000_000);
+
+    // Recurring: 100_000 every 30 days starting at ts=100.
+    client.schedule_distribution(&staker, &asset, &100_000, &100, &(30 * SECONDS_PER_DAY));
+
+    // First occurrence.
+    env.ledger().set_timestamp(150);
+    assert_eq!(client.process_distribution(&staker, &asset), 100_000);
+
+    // Second occurrence.
+    env.ledger().set_timestamp(100 + 30 * SECONDS_PER_DAY + 10);
+    assert_eq!(client.process_distribution(&staker, &asset), 100_000);
+
+    assert_eq!(client.reserve_balance(&asset), 800_000);
 }

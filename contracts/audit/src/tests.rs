@@ -107,7 +107,7 @@ fn test_log_event_sets_immutable_fields() {
         &symbol_short!("ok"),
         &String::from_str(&env, "ok"),
     );
-    let entry = client.query(&LogQuery::new(10)).get(0).unwrap();
+    let entry = client.query(&LogQuery::new(&env, 10)).get(0).unwrap();
     assert_eq!(entry.seq, seq);
     assert_eq!(entry.event_type, AuditEventType::Stake);
     assert_eq!(entry.actor, s);
@@ -134,7 +134,7 @@ fn test_log_event_stamps_ledger_timestamp() {
         &symbol_short!("ok"),
         &String::from_str(&env, ""),
     );
-    let entry = client.query(&LogQuery::new(10)).get(0).unwrap();
+    let entry = client.query(&LogQuery::new(&env, 10)).get(0).unwrap();
     assert_eq!(entry.timestamp, 1_700_000_000);
 }
 
@@ -184,7 +184,7 @@ fn test_query_returns_all_when_unfiltered() {
             &String::from_str(&env, ""),
         );
     }
-    let res = client.query(&LogQuery::new(10));
+    let res = client.query(&LogQuery::new(&env, 10));
     assert_eq!(res.len(), 5);
 }
 
@@ -213,7 +213,7 @@ fn test_query_by_event_type() {
         &symbol_short!("ok"),
         &String::from_str(&env, ""),
     );
-    let staked = client.query(&LogQuery::new(10).event_type(AuditEventType::Stake));
+    let staked = client.query(&LogQuery::new(&env, 10).event_type(AuditEventType::Stake));
     assert_eq!(staked.len(), 1);
     assert_eq!(staked.get(0).unwrap().event_type, AuditEventType::Stake);
 }
@@ -244,7 +244,7 @@ fn test_query_filters_by_portfolio() {
         &symbol_short!("ok"),
         &String::from_str(&env, ""),
     );
-    let only_xlm = client.query(&LogQuery::new(10).portfolio(xlm.clone()));
+    let only_xlm = client.query(&LogQuery::new(&env, 10).portfolio(xlm));
     assert_eq!(only_xlm.len(), 1);
     assert_eq!(only_xlm.get(0).unwrap().portfolio, xlm);
 }
@@ -266,7 +266,7 @@ fn test_query_limit_caps_results() {
             &String::from_str(&env, ""),
         );
     }
-    let res = client.query(&LogQuery::new(3));
+    let res = client.query(&LogQuery::new(&env, 3));
     assert_eq!(res.len(), 3);
 }
 
@@ -288,7 +288,7 @@ fn test_query_range_by_timestamp() {
             &String::from_str(&env, ""),
         );
     }
-    let q = LogQuery::new(10).from_ts(110).to_ts(120);
+    let q = LogQuery::new(&env, 10).from_ts(110).to_ts(120);
     let res = client.query(&q);
     assert_eq!(res.len(), 2, "expected only 110 and 120 entries");
     assert_eq!(res.get(0).unwrap().timestamp, 110);
@@ -401,7 +401,7 @@ fn test_prune_old_enforces_max_entries() {
     let _ = client.set_retention_policy(&admin, &policy);
     let pruned = client.prune_old(&admin);
     assert_eq!(pruned, 2);
-    let res = client.query(&LogQuery::new(10));
+    let res = client.query(&LogQuery::new(&env, 10));
     assert_eq!(res.len(), 3);
 }
 
@@ -466,7 +466,7 @@ fn test_export_jsonl_returns_one_per_entry() {
         &symbol_short!("ok"),
         &String::from_str(&env, "deposit"),
     );
-    let rows = client.export_jsonl(&LogQuery::new(10));
+    let rows = client.export_jsonl(&LogQuery::new(&env, 10));
     assert_eq!(rows.len(), 1);
     let r0 = rows.get(0).unwrap();
     let row = soroban_str_to_rust(&r0);
@@ -491,7 +491,7 @@ fn test_export_csv_header_and_rows() {
         &symbol_short!("ok"),
         &String::from_str(&env, "deposit"),
     );
-    let rows = client.export_csv(&LogQuery::new(10));
+    let rows = client.export_csv(&LogQuery::new(&env, 10));
     assert_eq!(rows.len(), 2);
     let r0 = rows.get(0).unwrap();
     let header_str = soroban_str_to_rust(&r0);
@@ -519,8 +519,8 @@ fn test_export_csv_escapes_special_characters() {
         &symbol_short!("ok"),
         &String::from_str(&env, "comma,with\"quotes"),
     );
-    let rows = client.export_csv(&LogQuery::new(10));
-    let r1 = rows.get(1).unwrap();
-    let body = soroban_str_to_rust(&r1);
-    assert!(body.contains("comma"));
+    let rows = client.export_csv(&LogQuery::new(&env, 10));
+    let body = rows.get(1).unwrap().to_string();
+    // Field should be wrapped in quotes because it contains a comma.
+    assert!(body.contains("\"comma,\"\"with\"\"quotes\""));
 }

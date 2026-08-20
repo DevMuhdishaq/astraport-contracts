@@ -4,18 +4,15 @@
 //! a single `AuditLog`. The contract entrypoint `query()` walks the
 //! append-only primary index and returns every entry that matches with a
 //! cap of `limit`.
-//!
-//! This is intentionally simple — secondary indexes are maintained by the
-//! contract library but the query currently iterates the primary index to
-//! keep the implementation small. The bucketed indices in [`crate::records`]
-//! remain available for future optimization.
 
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{contracttype, symbol_short, Address, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 
 use crate::records::{AuditEventType, AuditLog};
 
 /// Filter set for log queries.
+///
+/// Zero-valued / default fields mean "any"; non-zero narrows the search.
+/// Boolean flags control which filters are active.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub struct LogQuery {
@@ -23,16 +20,18 @@ pub struct LogQuery {
     pub from_ts: u64,
     /// Inclusive upper bound on `entry.timestamp`. `0` is treated as unset.
     pub to_ts: u64,
-    /// Optional event-type filter (stored as u32).
-    pub event_type: Option<u32>,
-    /// Flag indicating whether `actor` filter is active.
-    pub has_actor: bool,
-    /// Actor filter address.
+    /// Event-type filter. Ignored when `filter_event_type` is false.
+    pub event_type: AuditEventType,
+    /// Actor filter address. Ignored when `filter_actor` is false.
     pub actor: Address,
-    /// Flag indicating whether `portfolio` filter is active.
-    pub has_portfolio: bool,
-    /// Portfolio filter symbol.
+    /// Portfolio filter symbol. Ignored when `filter_portfolio` is false.
     pub portfolio: Symbol,
+    /// Whether `event_type` filtering is active.
+    pub filter_event_type: bool,
+    /// Whether `actor` filtering is active.
+    pub filter_actor: bool,
+    /// Whether `portfolio` filtering is active.
+    pub filter_portfolio: bool,
     /// Maximum number of entries returned.
     pub limit: u32,
     /// Reserved for future use (e.g. cursor-based pagination).
@@ -40,16 +39,18 @@ pub struct LogQuery {
 }
 
 impl LogQuery {
-    /// Build an empty query with a default limit.
-    pub fn new(limit: u32) -> Self {
+    /// Build an empty query with a default limit. Uses a dummy address for the
+    /// actor field (it is only consulted when `filter_actor` is true).
+    pub fn new(env: &Env, limit: u32) -> Self {
         Self {
             from_ts: 0,
             to_ts: 0,
-            event_type: None,
-            has_actor: false,
-            actor: Address::generate(&soroban_sdk::Env::default()),
-            has_portfolio: false,
-            portfolio: symbol_short!("none"),
+            event_type: AuditEventType::Custom,
+            actor: dummy_address(env),
+            portfolio: symbol_short!(""),
+            filter_event_type: false,
+            filter_actor: false,
+            filter_portfolio: false,
             limit,
             cursor: 0,
         }
@@ -69,21 +70,22 @@ impl LogQuery {
 
     /// Restrict the query to a single event type.
     pub fn event_type(mut self, t: AuditEventType) -> Self {
-        self.event_type = Some(t as u32);
+        self.event_type = t;
+        self.filter_event_type = true;
         self
     }
 
     /// Restrict the query to a single actor.
     pub fn actor(mut self, a: Address) -> Self {
-        self.has_actor = true;
         self.actor = a;
+        self.filter_actor = true;
         self
     }
 
     /// Restrict the query to a single portfolio.
     pub fn portfolio(mut self, p: Symbol) -> Self {
-        self.has_portfolio = true;
         self.portfolio = p;
+        self.filter_portfolio = true;
         self
     }
 
@@ -101,17 +103,26 @@ impl LogQuery {
         if self.to_ts != 0 && entry.timestamp > self.to_ts {
             return false;
         }
-        if let Some(t) = self.event_type {
-            if (entry.event_type as u32) != t {
+        if self.filter_event_type && entry.event_type != self.event_type {
+            return false;
+        }
+        if self.filter_actor {
+            if entry.actor.to_string() != self.actor.to_string() {
                 return false;
             }
         }
-        if self.has_actor && entry.actor != self.actor {
-            return false;
-        }
-        if self.has_portfolio && entry.portfolio != self.portfolio {
+        if self.filter_portfolio && entry.portfolio != self.portfolio {
             return false;
         }
         true
     }
+}
+
+/// Create a deterministic dummy address for the unused actor field.
+fn dummy_address(env: &Env) -> Address {
+    // Use the well-known "GA" strkey with 32 zero bytes — a valid but
+    // non-signing address. This is only used as a placeholder when the
+    // actor filter is inactive.
+    let bytes = soroban_sdk::Bytes::from_slice(env, &[0u8; 32]);
+    Address::from_string_bytes(&bytes)
 }

@@ -52,8 +52,9 @@ use crate::engine::YieldEngine;
 use crate::fixed_point::SCALE;
 use crate::projection::YieldProjector;
 use crate::records::{
-    CompoundingMode, DistributionSchedule, LockPosition, StakeDataKey, StakingConfig,
-    YieldDataKey, YieldHistoryEntry, YieldProjection, YieldRecord,
+    CompoundingMode, DistributionSchedule, DistributionType, LockPosition, StakeDataKey,
+    StakingConfig, YieldDataKey, YieldDistributionRecord, YieldHistoryEntry, YieldProjection,
+    YieldRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,14 +87,14 @@ pub enum Error {
     EmergencyConfigNotInitialized = 5,
     /// The amount requested for emergency unstake is invalid (≤ 0).
     InvalidEmergencyUnstakeAmount = 6,
-    /// The new balance would exceed the per-asset maximum stake.
-    ExceedsMaximumStake = 7,
-    /// The amount requested exceeds the currently unlocked portion.
-    ExceedsUnlockedAmount = 8,
-    /// Unauthorized caller.
-    Unauthorized = 7,
-    /// Already initialized.
-    AlreadyInitialized = 8,
+    /// Distributions are globally paused.
+    DistributionsPaused = 7,
+    /// The yield reserve has insufficient balance for this distribution.
+    InsufficientReserve = 8,
+    /// The claim amount must be positive.
+    InvalidClaimAmount = 9,
+    /// No yield position exists for this staker/asset pair.
+    NoYieldPosition = 10,
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +611,19 @@ impl StakingContract {
             .accrue(&staker, &asset)
             .expect("failed to accrue yield before claim");
         let claimed = engine.finalize_claim(record);
+        if claimed > 0 {
+            // Record in distribution history.
+            let reserve_after = engine.reserve_balance(&asset);
+            engine.record_distribution(&records::YieldDistributionRecord {
+                staker: staker.clone(),
+                asset: asset.clone(),
+                amount: claimed,
+                timestamp: env.ledger().timestamp(),
+                distribution_type: records::DistributionType::Claim,
+                accrued_at_claim: claimed,
+                reserve_after,
+            });
+        }
         env.events()
             .publish((symbol_short!("YLDCLAIM"), staker, asset), claimed);
         claimed
@@ -685,6 +699,157 @@ impl StakingContract {
     /// Process due distributions for a staker/asset pair.
     pub fn process_distribution(env: Env, staker: Address, asset: Symbol) -> i128 {
         YieldEngine::new(&env).process_distribution(&staker, &asset)
+    }
+
+    // -----------------------------------------------------------------------
+    // Yield distribution & claiming system
+    // -----------------------------------------------------------------------
+
+    /// Claim a specific `amount` of accrued yield (partial claim).
+    ///
+    /// Requires authorization from `staker`. If `amount` exceeds the accrued
+    /// yield, the full accrued amount is claimed. If a reserve exists for the
+    /// asset and is insufficient, the claim is capped to the reserve balance.
+    ///
+    /// Returns the actual amount claimed.
+    pub fn claim_yield_partial(
+        env: Env,
+        staker: Address,
+        asset: Symbol,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        staker.require_auth();
+        if amount <= 0 {
+            return Err(Error::InvalidClaimAmount);
+        }
+        let engine = YieldEngine::new(&env);
+        // Verify a yield position exists.
+        if engine.load_record(&staker, &asset).is_none() {
+            return Err(Error::NoYieldPosition);
+        }
+        let claimed = engine
+            .claim_yield_partial(&staker, &asset, amount)
+            .map_err(|_| Error::NoYieldPosition)?;
+        if claimed > 0 {
+            env.events()
+                .publish((symbol_short!("YLDPART"), staker, asset), claimed);
+        }
+        Ok(claimed)
+    }
+
+    /// Batch claim yield for multiple stakers on a single asset.
+    ///
+    /// Gas optimization: processes all stakers in one call. Each staker
+    /// claims all their accrued yield. If distributions are paused, all
+    /// claims return 0.
+    ///
+    /// Returns a `Vec` of `(staker, claimed_amount)` pairs.
+    pub fn batch_claim(
+        env: Env,
+        stakers: Vec<Address>,
+        asset: Symbol,
+    ) -> Vec<(Address, i128)> {
+        // Require auth for each staker.
+        for i in 0..stakers.len() {
+            stakers.get(i).unwrap().require_auth();
+        }
+        let results = YieldEngine::new(&env).batch_claim(&stakers, &asset);
+        // Emit a summary event.
+        let mut total_claimed: i128 = 0;
+        for i in 0..results.len() {
+            let (_, amount) = results.get(i).unwrap();
+            total_claimed += amount;
+        }
+        if total_claimed > 0 {
+            env.events()
+                .publish((symbol_short!("BATCHYLD"), asset), total_claimed);
+        }
+        results
+    }
+
+    /// Fund the yield reserve for an asset.
+    ///
+    /// Admin-only. Increases the reserve balance used to back distributions.
+    pub fn fund_reserve(env: Env, admin: Address, asset: Symbol, amount: i128) -> i128 {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        YieldEngine::new(&env).fund_reserve(&asset, amount)
+    }
+
+    /// Return the current yield reserve balance for an asset.
+    pub fn reserve_balance(env: Env, asset: Symbol) -> i128 {
+        YieldEngine::new(&env).reserve_balance(&asset)
+    }
+
+    /// Withdraw from the yield reserve.
+    ///
+    /// Admin-only. Reduces the reserve balance and returns the new balance.
+    pub fn withdraw_reserve(env: Env, admin: Address, asset: Symbol, amount: i128) -> i128 {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        YieldEngine::new(&env).withdraw_reserve(&asset, amount)
+    }
+
+    /// Pause all yield distributions globally.
+    ///
+    /// Admin-only. When paused, `process_distribution` and `batch_claim`
+    /// return 0 without modifying state. On-demand `claim_yield` and
+    /// `claim_yield_partial` continue to work (they draw from accrued yield
+    /// directly).
+    pub fn pause_distributions(env: Env, admin: Address) -> Symbol {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        YieldEngine::new(&env).set_paused(true);
+        symbol_short!("paused")
+    }
+
+    /// Resume yield distributions after a pause.
+    pub fn unpause_distributions(env: Env, admin: Address) -> Symbol {
+        admin.require_auth();
+        Self::assert_admin(&env, &admin);
+        YieldEngine::new(&env).set_paused(false);
+        symbol_short!("active")
+    }
+
+    /// Whether distributions are currently paused.
+    pub fn distributions_paused(env: Env) -> bool {
+        YieldEngine::new(&env).is_paused()
+    }
+
+    /// Full distribution history for a `(staker, asset)` pair.
+    pub fn distribution_history(
+        env: Env,
+        staker: Address,
+        asset: Symbol,
+    ) -> Vec<YieldDistributionRecord> {
+        YieldEngine::new(&env).distribution_history(&staker, &asset)
+    }
+
+    /// Distribution history filtered by time range `[from_ts, to_ts]`
+    /// (inclusive).
+    pub fn distribution_history_range(
+        env: Env,
+        staker: Address,
+        asset: Symbol,
+        from_ts: u64,
+        to_ts: u64,
+    ) -> Vec<YieldDistributionRecord> {
+        YieldEngine::new(&env).distribution_history_range(&staker, &asset, from_ts, to_ts)
+    }
+
+    /// Distribution history filtered by type (Claim, Scheduled, BatchClaim).
+    pub fn distribution_history_by_type(
+        env: Env,
+        staker: Address,
+        asset: Symbol,
+        dist_type: DistributionType,
+    ) -> Vec<YieldDistributionRecord> {
+        YieldEngine::new(&env).distribution_history_by_type(&staker, &asset, dist_type)
+    }
+
+    /// Total yield claimed by a staker for an asset across all distributions.
+    pub fn total_yield_claimed(env: Env, staker: Address, asset: Symbol) -> i128 {
+        YieldEngine::new(&env).total_yield_claimed(&staker, &asset)
     }
 }
 

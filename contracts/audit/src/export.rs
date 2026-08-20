@@ -13,6 +13,20 @@ use soroban_sdk::{Env, FromVal, String, Symbol, Vec};
 
 use crate::records::{AuditEventType, AuditLog};
 
+/// Helper: copy a Soroban `String` into a heap `alloc::string::String`.
+fn soroban_str(s: &String) -> RustString {
+    let len = s.len() as usize;
+    let mut buf = alloc::vec![0u8; len];
+    s.copy_into_slice(&mut buf);
+    unsafe { RustString::from_utf8_unchecked(buf) }
+}
+
+/// Helper: convert a `Symbol` to a heap `alloc::string::String`.
+fn symbol_to_rust(s: &soroban_sdk::Symbol) -> RustString {
+    // Symbol::to_string() returns alloc::string::String via ToString trait.
+    s.to_string()
+}
+
 /// CSV header shared by all exports. Column order is part of the contract
 /// protocol and is pinned by tests.
 pub const CSV_HEADER: &str =
@@ -41,11 +55,11 @@ pub fn format_json_entry(env: &Env, entry: &AuditLog) -> String {
         entry.seq,
         entry.timestamp,
         event_type_name(entry.event_type),
-        entry.actor,
+        soroban_str(&entry.actor.to_string()),
         entry.permissions,
-        entry.portfolio,
-        entry.outcome,
-        json_escape(&to_rust_str(&entry.detail)),
+        symbol_to_rust(&entry.portfolio),
+        symbol_to_rust(&entry.outcome),
+        json_escape(&soroban_str(&entry.detail)),
     );
     String::from_str(env, &rs)
 }
@@ -57,11 +71,11 @@ pub fn format_csv_row(env: &Env, entry: &AuditLog) -> String {
         entry.seq,
         entry.timestamp,
         event_type_name(entry.event_type),
-        entry.actor,
+        soroban_str(&entry.actor.to_string()),
         entry.permissions,
-        entry.portfolio,
-        entry.outcome,
-        csv_escape(&to_rust_str(&entry.detail)),
+        symbol_to_rust(&entry.portfolio),
+        symbol_to_rust(&entry.outcome),
+        csv_escape(&soroban_str(&entry.detail)),
     );
     String::from_str(env, &rs)
 }

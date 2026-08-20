@@ -50,7 +50,7 @@ impl<'a> AuditLogger<'a> {
         detail: String,
     ) -> u64 {
         let fn_name = symbol_short!("log_event");
-        let args = (
+        let args: Vec<soroban_sdk::Val> = (
             actor,
             event_type,
             portfolio,
@@ -61,6 +61,7 @@ impl<'a> AuditLogger<'a> {
             detail,
         )
             .into_val(self.env);
+        // invoke_contract returns T directly; panics on failure.
         self.env
             .invoke_contract::<u64>(&self.contract, &fn_name, args)
     }
@@ -69,7 +70,11 @@ impl<'a> AuditLogger<'a> {
     /// verification requests (e.g. compliance reconciliation).
     pub fn query(&self) -> Vec<AuditLog> {
         let fn_name = symbol_short!("query");
-        self.env
-            .invoke_contract::<Vec<AuditLog>>(&self.contract, &fn_name, ().into_val(self.env))
+        let empty_args: Vec<soroban_sdk::Val> = Vec::new(self.env);
+        self.env.invoke_contract::<Vec<AuditLog>>(
+            &self.contract,
+            &fn_name,
+            empty_args,
+        )
     }
 }

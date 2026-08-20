@@ -28,7 +28,7 @@
 extern crate alloc;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 pub mod checksum;
