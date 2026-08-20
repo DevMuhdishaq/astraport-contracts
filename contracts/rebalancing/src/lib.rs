@@ -1,11 +1,15 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String as SorobanString, Symbol, Vec};
 
 use astraport_audit::logger::AuditLogger;
 use astraport_audit::records::{permissions, AuditEventType, StateSnapshot};
 
 /// Default tolerance used when deciding whether a holding needs rebalancing.
 const DEFAULT_DRIFT_THRESHOLD_BPS: u32 = 100;
+
+/// Allocation tolerance: allocations must sum to 10_000 ± ALLOCATION_TOLERANCE_BPS.
+/// 0.1% = 10 basis points.
+const ALLOCATION_TOLERANCE_BPS: u32 = 10;
 
 /// Errors returned by the rebalancing contract.
 #[contracterror]
@@ -24,6 +28,16 @@ pub enum RebalancingError {
     MultiAssetRebalanceFailed = 5,
     /// Caller is not authorized to modify this portfolio.
     Unauthorized = 6,
+    /// The portfolio already exists.
+    PortfolioAlreadyExists = 7,
+    /// The portfolio does not exist.
+    PortfolioNotFound = 8,
+    /// The asset list is empty.
+    EmptyAssets = 9,
+    /// The portfolio name is empty.
+    EmptyName = 10,
+    /// The allocation percentages do not sum to 100% (within ±0.1% tolerance).
+    AllocationSumOutOfRange = 11,
 }
 
 #[contracttype]
@@ -33,6 +47,36 @@ pub enum RebalanceInterval {
     Daily,
     Weekly,
     Monthly,
+}
+
+/// Metadata for a portfolio including naming and timestamps.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortfolioMetadata {
+    /// Human-readable portfolio name.
+    pub name: SorobanString,
+    /// Optional description of the portfolio strategy.
+    pub description: SorobanString,
+    /// Ledger timestamp when the portfolio was created.
+    pub created_at: u64,
+    /// Ledger timestamp of the last modification.
+    pub last_modified: u64,
+}
+
+/// A complete portfolio with owner, assets, target allocations, and metadata.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Portfolio {
+    /// Unique portfolio identifier.
+    pub id: Symbol,
+    /// Address of the portfolio owner.
+    pub owner: Address,
+    /// Ordered list of asset symbols in this portfolio.
+    pub assets: Vec<Symbol>,
+    /// Target allocation weights in basis points per asset.
+    pub target_allocation: TargetAllocation,
+    /// Portfolio metadata (name, description, timestamps).
+    pub metadata: PortfolioMetadata,
 }
 
 #[contracttype]
@@ -113,6 +157,8 @@ pub enum DataKey {
     AuditSink,
     /// Portfolio owner address mapping: portfolio_id -> Address
     Owner(Symbol),
+    /// Full portfolio record: portfolio_id -> Portfolio
+    Portfolio(Symbol),
 }
 
 /// Event data for manual rebalance - includes drift summary via timestamp
@@ -172,6 +218,204 @@ impl RebalancingContract {
     /// Success symbol if initialization succeeds
     pub fn initialize(_env: Env) -> Symbol {
         symbol_short!("ok")
+    }
+
+    /// Create a new portfolio with the given configuration.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `owner` - Portfolio owner address (must authorize)
+    /// * `portfolio_id` - Unique identifier for the portfolio
+    /// * `name` - Human-readable portfolio name (must not be empty)
+    /// * `description` - Portfolio description
+    /// * `assets` - Ordered list of asset symbols (must not be empty)
+    /// * `target_allocation` - Target allocation weights in basis points
+    ///
+    /// # Returns
+    /// `Ok(Portfolio)` on success.
+    /// `Err(PortfolioAlreadyExists)` if a portfolio with this ID already exists.
+    /// `Err(EmptyAssets)` if the asset list is empty.
+    /// `Err(EmptyName)` if the portfolio name is empty.
+    /// `Err(AllocationSumOutOfRange)` if allocations don't sum to 10_000 ± 10 bps.
+    pub fn initialize_portfolio(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        name: SorobanString,
+        description: SorobanString,
+        assets: Vec<Symbol>,
+        target_allocation: TargetAllocation,
+    ) -> Result<Portfolio, RebalancingError> {
+        owner.require_auth();
+
+        // Ensure portfolio does not already exist
+        let portfolio_key = DataKey::Portfolio(portfolio_id.clone());
+        if env.storage().persistent().has(&portfolio_key) {
+            return Err(RebalancingError::PortfolioAlreadyExists);        }
+
+        // Validate name is non-empty
+        if name.len() == 0 {
+            return Err(RebalancingError::EmptyName);
+        }
+
+        // Validate asset list is non-empty
+        if assets.len() == 0 {
+            return Err(RebalancingError::EmptyAssets);
+        }
+
+        // Validate allocation sum is within tolerance: 10_000 ± ALLOCATION_TOLERANCE_BPS
+        let total = Self::allocation_sum(&target_allocation);
+        if total < (10_000 - ALLOCATION_TOLERANCE_BPS)
+            || total > (10_000 + ALLOCATION_TOLERANCE_BPS)
+        {
+            return Err(RebalancingError::AllocationSumOutOfRange);
+        }
+
+        // Validate that every allocated asset is in the assets list
+        for (asset, _weight) in target_allocation.allocations.iter() {
+            if !assets.contains(asset) {
+                return Err(RebalancingError::InvalidAllocation);
+            }
+        }
+
+        let now = env.ledger().timestamp();
+
+        let portfolio = Portfolio {
+            id: portfolio_id.clone(),
+            owner: owner.clone(),
+            assets,
+            target_allocation: target_allocation.clone(),
+            metadata: PortfolioMetadata {
+                name,
+                description,
+                created_at: now,
+                last_modified: now,
+            },
+        };
+
+        // Store the full portfolio record
+        env.storage().persistent().set(&portfolio_key, &portfolio);
+
+        // Also store the owner separately for backward compatibility
+        // with existing owner-check logic
+        let owner_key = DataKey::Owner(portfolio_id.clone());
+        if !env.storage().persistent().has(&owner_key) {
+            env.storage().persistent().set(&owner_key, &owner);
+        }
+
+        // Store the target allocation separately for backward compatibility
+        // with rebalance calculations
+        let alloc_key = DataKey::Allocation(portfolio_id);
+        env.storage().persistent().set(&alloc_key, &target_allocation);
+
+        Ok(portfolio)
+    }
+
+    /// Retrieve a portfolio by its ID.
+    pub fn get_portfolio(env: Env, portfolio_id: Symbol) -> Result<Portfolio, RebalancingError> {
+        let key = DataKey::Portfolio(portfolio_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(RebalancingError::PortfolioNotFound)
+    }
+
+    /// Update a portfolio's metadata (name and description). Only the owner can modify.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `owner` - Portfolio owner address (must authorize and match stored owner)
+    /// * `portfolio_id` - Identifier for the portfolio
+    /// * `name` - New portfolio name (must not be empty)
+    /// * `description` - New portfolio description
+    ///
+    /// # Returns
+    /// `Ok(Portfolio)` with updated metadata on success.
+    /// `Err(PortfolioNotFound)` if the portfolio does not exist.
+    /// `Err(EmptyName)` if the new name is empty.
+    /// `Err(Unauthorized)` if the caller is not the portfolio owner.
+    pub fn update_portfolio_metadata(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        name: SorobanString,
+        description: SorobanString,
+    ) -> Result<Portfolio, RebalancingError> {
+        Self::require_owner_auth(&env, &owner, &portfolio_id)?;
+
+        // Validate name is non-empty
+        if name.len() == 0 {
+            return Err(RebalancingError::EmptyName);
+        }
+
+        let portfolio_key = DataKey::Portfolio(portfolio_id.clone());
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .ok_or(RebalancingError::PortfolioNotFound)?;
+
+        portfolio.metadata.name = name;
+        portfolio.metadata.description = description;
+        portfolio.metadata.last_modified = env.ledger().timestamp();
+
+        env.storage().persistent().set(&portfolio_key, &portfolio);
+
+        Ok(portfolio)
+    }
+
+    /// Update a portfolio's target allocation. Only the owner can modify.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `owner` - Portfolio owner address (must authorize and match stored owner)
+    /// * `portfolio_id` - Identifier for the portfolio
+    /// * `target_allocation` - New target allocation weights in basis points
+    ///
+    /// # Returns
+    /// `Ok(Portfolio)` with updated allocation on success.
+    /// `Err(AllocationSumOutOfRange)` if allocations don't sum to 10_000 ± 10 bps.
+    pub fn update_portfolio_allocation(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        target_allocation: TargetAllocation,
+    ) -> Result<Portfolio, RebalancingError> {
+        Self::require_owner_auth(&env, &owner, &portfolio_id)?;
+
+        // Validate allocation sum is within tolerance
+        let total = Self::allocation_sum(&target_allocation);
+        if total < (10_000 - ALLOCATION_TOLERANCE_BPS)
+            || total > (10_000 + ALLOCATION_TOLERANCE_BPS)
+        {
+            return Err(RebalancingError::AllocationSumOutOfRange);
+        }
+
+        let portfolio_key = DataKey::Portfolio(portfolio_id.clone());
+        let mut portfolio: Portfolio = env
+            .storage()
+            .persistent()
+            .get(&portfolio_key)
+            .ok_or(RebalancingError::PortfolioNotFound)?;
+
+        portfolio.target_allocation = target_allocation.clone();
+        portfolio.metadata.last_modified = env.ledger().timestamp();
+
+        env.storage().persistent().set(&portfolio_key, &portfolio);
+        // Also update the standalone allocation for rebalance calculations
+        let alloc_key = DataKey::Allocation(portfolio_id);
+        env.storage().persistent().set(&alloc_key, &target_allocation);
+
+        Ok(portfolio)
+    }
+
+    /// Helper: compute the sum of allocation weights in basis points.
+    fn allocation_sum(allocation: &TargetAllocation) -> u32 {
+        let mut total: u32 = 0;
+        for (_asset, weight) in allocation.allocations.iter() {
+            total += weight;
+        }
+        total
     }
 
     /// Helper to enforce portfolio owner authorization.
@@ -712,7 +956,7 @@ impl RebalancingContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Env, Map};
+    use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Env, Map, String as SorobanString};
 
     fn weights(env: &Env, entries: &[(Symbol, u32)]) -> Map<Symbol, u32> {
         let mut result = Map::new(env);
@@ -860,5 +1104,430 @@ mod tests {
         assert!(client.get_current_holdings(&portfolio).is_some());
         assert_eq!(client.get_status(&portfolio), symbol_short!("ok"));
         assert_eq!(client.get_drift_threshold_bps(&portfolio), DEFAULT_DRIFT_THRESHOLD_BPS);
+    }
+
+    // =========================================================================
+    // Portfolio Creation & Initialization Tests
+    // =========================================================================
+
+    /// Helper to create a valid portfolio configuration.
+    fn valid_portfolio_args(env: &Env) -> (Symbol, SorobanString, SorobanString, Vec<Symbol>, TargetAllocation) {
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(env, "Growth Portfolio");
+        let description = SorobanString::from_str(env, "A diversified growth portfolio");
+        let assets = soroban_sdk::vec![&env, symbol_short!("USDC"), symbol_short!("XLM"), symbol_short!("BTC")];
+        let allocations = weights(
+            &env,
+            &[
+                (symbol_short!("USDC"), 4_000),
+                (symbol_short!("XLM"), 3_500),
+                (symbol_short!("BTC"), 2_500),
+            ],
+        );
+        let target_allocation = TargetAllocation { allocations };
+        (portfolio_id, name, description, assets, target_allocation)
+    }
+
+    #[test]
+    fn test_initialize_portfolio_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        let result = client.initialize_portfolio(
+            &owner,
+            &portfolio_id,
+            &name,
+            &description,
+            &assets,
+            &target_allocation,
+        );
+
+        assert!(result.is_ok());
+        let portfolio = result.unwrap();
+        assert_eq!(portfolio.id, portfolio_id);
+        assert_eq!(portfolio.owner, owner);
+        assert_eq!(portfolio.assets.len(), 3);
+        assert_eq!(portfolio.metadata.name, SorobanString::from_str(&env, "Growth Portfolio"));
+        assert_eq!(portfolio.metadata.description, SorobanString::from_str(&env, "A diversified growth portfolio"));
+        assert!(portfolio.metadata.created_at > 0);
+        assert_eq!(portfolio.metadata.created_at, portfolio.metadata.last_modified);
+    }
+
+    #[test]
+    fn test_initialize_portfolio_stores_and_retrieves() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        client.initialize_portfolio(&owner, &portfolio_id, &name, &description, &assets, &target_allocation).unwrap();
+
+        // Retrieve the portfolio and verify all fields
+        let retrieved = client.get_portfolio(&portfolio_id);
+        assert!(retrieved.is_ok());
+        let portfolio = retrieved.unwrap();
+        assert_eq!(portfolio.id, portfolio_id);
+        assert_eq!(portfolio.owner, owner);
+        assert_eq!(portfolio.assets.len(), 3);
+        assert!(portfolio.assets.contains(symbol_short!("USDC")));
+        assert!(portfolio.assets.contains(symbol_short!("XLM")));
+        assert!(portfolio.assets.contains(symbol_short!("BTC")));
+        assert_eq!(portfolio.target_allocation.allocations.get(symbol_short!("USDC")), Some(4_000));
+        assert_eq!(portfolio.target_allocation.allocations.get(symbol_short!("XLM")), Some(3_500));
+        assert_eq!(portfolio.target_allocation.allocations.get(symbol_short!("BTC")), Some(2_500));
+    }
+
+    #[test]
+    fn test_initialize_portfolio_already_exists() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        // First creation succeeds
+        let first = client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert!(first.is_ok());
+
+        // Second creation with same ID fails
+        let second = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert_eq!(second, Err(Ok(RebalancingError::PortfolioAlreadyExists)));
+    }
+
+    #[test]
+    fn test_initialize_portfolio_empty_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(&env, "Empty Assets");
+        let description = SorobanString::from_str(&env, "Should fail");
+        let assets: Vec<Symbol> = soroban_sdk::vec![&env];
+        let allocations = weights(&env, &[(symbol_short!("USDC"), 10_000)]);
+        let target_allocation = TargetAllocation { allocations };
+
+        let result = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert_eq!(result, Err(Ok(RebalancingError::EmptyAssets)));
+    }
+
+    #[test]
+    fn test_initialize_portfolio_empty_name() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(&env, "");
+        let description = SorobanString::from_str(&env, "desc");
+        let assets = soroban_sdk::vec![&env, symbol_short!("USDC")];
+        let allocations = weights(&env, &[(symbol_short!("USDC"), 10_000)]);
+        let target_allocation = TargetAllocation { allocations };
+
+        let result = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert_eq!(result, Err(Ok(RebalancingError::EmptyName)));
+    }
+
+    #[test]
+    fn test_initialize_portfolio_allocation_sum_too_low() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(&env, "Bad Alloc");
+        let description = SorobanString::from_str(&env, "desc");
+        let assets = soroban_sdk::vec![&env, symbol_short!("USDC"), symbol_short!("XLM")];
+        // Sum = 9900, which is 100 bps below 10_000 — well outside the ±10 bps tolerance
+        let allocations = weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 4_900)]);
+        let target_allocation = TargetAllocation { allocations };
+
+        let result = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert_eq!(result, Err(Ok(RebalancingError::AllocationSumOutOfRange)));
+    }
+
+    #[test]
+    fn test_initialize_portfolio_allocation_sum_too_high() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(&env, "Bad Alloc");
+        let description = SorobanString::from_str(&env, "desc");
+        let assets = soroban_sdk::vec![&env, symbol_short!("USDC"), symbol_short!("XLM")];
+        // Sum = 10_100, which is 100 bps above 10_000 — well outside the ±10 bps tolerance
+        let allocations = weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 5_100)]);
+        let target_allocation = TargetAllocation { allocations };
+
+        let result = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert_eq!(result, Err(Ok(RebalancingError::AllocationSumOutOfRange)));
+    }
+
+    #[test]
+    fn test_initialize_portfolio_allocation_within_tolerance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(&env, "Tolerance Test");
+        let description = SorobanString::from_str(&env, "desc");
+        let assets = soroban_sdk::vec![&env, symbol_short!("USDC"), symbol_short!("XLM")];
+        // Sum = 10_005, which is within the ±10 bps tolerance
+        let allocations = weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 5_005)]);
+        let target_allocation = TargetAllocation { allocations };
+
+        let result = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_initialize_portfolio_allocation_at_boundary_low() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(&env, "Boundary");
+        let description = SorobanString::from_str(&env, "desc");
+        let assets = soroban_sdk::vec![&env, symbol_short!("USDC"), symbol_short!("XLM")];
+        // Sum = 9_990 — exactly at the lower tolerance boundary
+        let allocations = weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 4_990)]);
+        let target_allocation = TargetAllocation { allocations };
+
+        let result = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_initialize_portfolio_allocation_at_boundary_high() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let portfolio_id = symbol_short!("myportf");
+        let name = SorobanString::from_str(&env, "Boundary");
+        let description = SorobanString::from_str(&env, "desc");
+        let assets = soroban_sdk::vec![&env, symbol_short!("USDC"), symbol_short!("XLM")];
+        // Sum = 10_010 — exactly at the upper tolerance boundary
+        let allocations = weights(&env, &[(symbol_short!("USDC"), 5_000), (symbol_short!("XLM"), 5_010)]);
+        let target_allocation = TargetAllocation { allocations };
+
+        let result = client.try_initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_initialize_portfolio_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        // Owner creates the portfolio
+        client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        ).unwrap();
+
+        // Attacker tries to update metadata — should be rejected
+        let new_name = SorobanString::from_str(&env, "Hacked Name");
+        let new_desc = SorobanString::from_str(&env, "hacked");
+        let result = client.try_update_portfolio_metadata(&attacker, &portfolio_id, &new_name, &new_desc);
+        assert_eq!(result, Err(Ok(RebalancingError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_update_portfolio_metadata_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        ).unwrap();
+
+        // Advance the ledger to ensure last_modified changes
+        let mut ledger = env.ledger().get();
+        ledger.timestamp = 1000;
+        env.ledger().set(ledger);
+n        let new_name = SorobanString::from_str(&env, "Updated Portfolio");
+        let new_desc = SorobanString::from_str(&env, "Updated description");
+        let updated = client.update_portfolio_metadata(&owner, &portfolio_id, &new_name, &new_desc);
+        assert!(updated.is_ok());
+
+        let portfolio = updated.unwrap();
+        assert_eq!(portfolio.metadata.name, SorobanString::from_str(&env, "Updated Portfolio"));
+        assert_eq!(portfolio.metadata.description, SorobanString::from_str(&env, "Updated description"));
+        assert!(portfolio.metadata.last_modified >= 1000);
+    }
+
+    #[test]
+    fn test_update_portfolio_metadata_empty_name() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        ).unwrap();
+
+        let empty_name = SorobanString::from_str(&env, "");
+        let new_desc = SorobanString::from_str(&env, "desc");
+        let result = client.try_update_portfolio_metadata(&owner, &portfolio_id, &empty_name, &new_desc);
+        assert_eq!(result, Err(Ok(RebalancingError::EmptyName)));
+    }
+
+    #[test]
+    fn test_update_portfolio_metadata_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let nonexistent = symbol_short!("nosuch");
+        let new_name = SorobanString::from_str(&env, "Name");
+        let new_desc = SorobanString::from_str(&env, "desc");
+
+        let result = client.try_update_portfolio_metadata(&owner, &nonexistent, &new_name, &new_desc);
+        assert_eq!(result, Err(Ok(RebalancingError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_update_portfolio_allocation_success() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        ).unwrap();
+
+        let mut ledger = env.ledger().get();
+        ledger.timestamp = 2000;
+        env.ledger().set(ledger);
+
+        // Update to a new valid allocation
+        let new_alloc = weights(
+            &env,
+            &[
+                (symbol_short!("USDC"), 3_000),
+                (symbol_short!("XLM"), 3_000),
+                (symbol_short!("BTC"), 4_000),
+            ],
+        );
+        let new_target = TargetAllocation { allocations: new_alloc };
+        let result = client.update_portfolio_allocation(&owner, &portfolio_id, &new_target);
+        assert!(result.is_ok());
+
+        let portfolio = result.unwrap();
+        assert_eq!(portfolio.target_allocation.allocations.get(symbol_short!("USDC")), Some(3_000));
+        assert_eq!(portfolio.target_allocation.allocations.get(symbol_short!("XLM")), Some(3_000));
+        assert_eq!(portfolio.target_allocation.allocations.get(symbol_short!("BTC")), Some(4_000));
+        assert!(portfolio.metadata.last_modified >= 2000);
+    }
+
+    #[test]
+    fn test_update_portfolio_allocation_out_of_range() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        ).unwrap();
+
+        // Bad allocation: sum = 8_000
+        let bad_alloc = weights(
+            &env,
+            &[
+                (symbol_short!("USDC"), 4_000),
+                (symbol_short!("XLM"), 4_000),
+            ],
+        );
+        let bad_target = TargetAllocation { allocations: bad_alloc };
+        let result = client.try_update_portfolio_allocation(&owner, &portfolio_id, &bad_target);
+        assert_eq!(result, Err(Ok(RebalancingError::AllocationSumOutOfRange)));
+    }
+
+    #[test]
+    fn test_get_portfolio_not_found() {
+        let env = Env::default();
+        let client = client(&env);
+        let nonexistent = symbol_short!("nosuch");
+        let result = client.try_get_portfolio(&nonexistent);
+        assert_eq!(result, Err(Ok(RebalancingError::PortfolioNotFound)));
+    }
+
+    #[test]
+    fn test_initialize_portfolio_sets_owner_for_rebalance_compat() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        ).unwrap();
+
+        // The owner should be accessible via get_owner (backward compat with rebalance)
+        assert_eq!(client.get_owner(&portfolio_id), Some(owner.clone()));
+
+        // The allocation should be accessible via get_target_allocation
+        let stored_alloc = client.get_target_allocation(&portfolio_id);
+        assert!(stored_alloc.is_some());
+    }
+
+    #[test]
+    fn test_initialize_portfolio_timestamps_are_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = client(&env);
+        let owner = Address::generate(&env);
+        let (portfolio_id, name, description, assets, target_allocation) = valid_portfolio_args(&env);
+
+        // Set ledger timestamp
+        let mut ledger = env.ledger().get();
+        ledger.timestamp = 5000;
+        env.ledger().set(ledger);
+
+        let portfolio = client.initialize_portfolio(
+            &owner, &portfolio_id, &name, &description, &assets, &target_allocation,
+        ).unwrap();
+
+        assert_eq!(portfolio.metadata.created_at, 5000);
+        assert_eq!(portfolio.metadata.last_modified, 5000);
     }
 }
