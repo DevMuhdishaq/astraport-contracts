@@ -90,6 +90,10 @@ pub enum Error {
     ExceedsMaximumStake = 7,
     /// The amount requested exceeds the currently unlocked portion.
     ExceedsUnlockedAmount = 8,
+    /// Unauthorized caller.
+    Unauthorized = 7,
+    /// Already initialized.
+    AlreadyInitialized = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,13 +144,13 @@ impl StakingContract {
     /// Initialize the staking contract with an admin.
     ///
     /// Can only be called once; subsequent calls will panic.
-    pub fn initialize(env: Env, admin: Address) -> Symbol {
+    pub fn initialize(env: Env, admin: Address) -> Result<Symbol, Error> {
         let storage = env.storage().persistent();
         if storage.has(&YieldDataKey::Admin) {
-            panic!("already initialized");
+            return Err(Error::AlreadyInitialized);
         }
         storage.set(&YieldDataKey::Admin, &admin);
-        symbol_short!("ok")
+        Ok(symbol_short!("ok"))
     }
 
     // -----------------------------------------------------------------------
@@ -314,9 +318,9 @@ impl StakingContract {
         lock_start_ts: u64,
         unlock_ts: u64,
         locked_amount: i128,
-    ) -> Symbol {
+    ) -> Result<Symbol, Error> {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_admin(&env, &admin)?;
 
         let pos = LockPosition {
             staker: staker.clone(),
@@ -327,7 +331,7 @@ impl StakingContract {
         env.storage()
             .persistent()
             .set(&StakeDataKey::LockPosition(staker), &pos);
-        symbol_short!("ok")
+        Ok(symbol_short!("ok"))
     }
 
     /// Query the lock position for a staker, if any.
@@ -367,9 +371,9 @@ impl StakingContract {
         cooldown_seconds: u64,
         treasury: Address,
         enabled: bool,
-    ) -> Symbol {
+    ) -> Result<Symbol, Error> {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_admin(&env, &admin)?;
 
         let config = EmergencyUnstakeConfig {
             penalty_start_bps,
@@ -382,7 +386,7 @@ impl StakingContract {
         env.storage()
             .persistent()
             .set(&EmergencyDataKey::Config, &config);
-        symbol_short!("ok")
+        Ok(symbol_short!("ok"))
     }
 
     /// Perform an emergency unstake before the lock-up period expires.
@@ -415,11 +419,11 @@ impl StakingContract {
         staker: Address,
         asset: Symbol,
         amount: i128,
-    ) -> EmergencyUnstakeRecord {
+    ) -> Result<EmergencyUnstakeRecord, Error> {
         staker.require_auth();
 
         if amount <= 0 {
-            panic!("InvalidEmergencyUnstakeAmount");
+            return Err(Error::InvalidEmergencyUnstakeAmount);
         }
 
         // --- current balance --------------------------------------------
@@ -430,10 +434,9 @@ impl StakingContract {
             .get(&balance_key)
             .unwrap_or_default();
 
-        assert!(
-            amount <= current_balance,
-            "InsufficientBalanceForEmergencyUnstake"
-        );
+        if amount > current_balance {
+            return Err(Error::InsufficientBalance);
+        }
 
         // --- lock position (use defaults if none set) -------------------
         let (lock_start_ts, unlock_ts) = match env
@@ -458,7 +461,7 @@ impl StakingContract {
             current_balance,
             lock_start_ts,
             unlock_ts,
-        );
+        )?;
 
         // --- reduce the staked balance by the FULL gross amount ---------
         // The penalty is deducted from `amount_returned`; the full `amount`
@@ -483,11 +486,11 @@ impl StakingContract {
             if pos.locked_amount == 0 {
                 env.storage()
                     .persistent()
-                    .remove(&StakeDataKey::LockPosition(staker));
+                    .remove(&StakeDataKey::LockPosition(staker.clone()));
             } else {
                 env.storage()
                     .persistent()
-                    .set(&StakeDataKey::LockPosition(staker), &pos);
+                    .set(&StakeDataKey::LockPosition(staker.clone()), &pos);
             }
         }
 
@@ -503,7 +506,7 @@ impl StakingContract {
             "emergency_unstake",
         );
 
-        record
+        Ok(record)
     }
 
     // -----------------------------------------------------------------------
@@ -553,13 +556,13 @@ impl StakingContract {
     /// Set the alert threshold for staking changes.
     ///
     /// Only callable by the admin set during `initialize`.
-    pub fn set_alert_threshold(env: Env, admin: Address, threshold: i128) -> Symbol {
+    pub fn set_alert_threshold(env: Env, admin: Address, threshold: i128) -> Result<Symbol, Error> {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_admin(&env, &admin)?;
         env.storage()
             .persistent()
             .set(&YieldDataKey::AlertThreshold, &threshold);
-        symbol_short!("ok")
+        Ok(symbol_short!("ok"))
     }
 
     /// Reconfigure the default APR and compounding mode for new yield positions.
@@ -690,15 +693,18 @@ impl StakingContract {
 // ---------------------------------------------------------------------------
 
 impl StakingContract {
-    /// Panic with a descriptive message if `admin` does not match the stored
+    /// Return Err(Error::Unauthorized) if `admin` does not match the stored
     /// admin address.
-    fn assert_admin(env: &Env, admin: &Address) {
+    fn assert_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         let stored_admin: Address = env
             .storage()
             .persistent()
             .get(&YieldDataKey::Admin)
-            .expect("contract not initialized");
-        assert!(stored_admin == *admin, "caller is not admin");
+            .ok_or(Error::Unauthorized)?;
+        if stored_admin != *admin {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
     }
 
     /// Read the staked balance for a `(staker, asset)` pair, defaulting to `0`.
@@ -834,11 +840,11 @@ impl StakingContract {
 /// Integration with the audit-log contract.
 impl StakingContract {
     /// Configure the audit-log sink address. Admin-only.
-    pub fn set_audit_sink(env: Env, admin: Address, sink: Address) -> Symbol {
+    pub fn set_audit_sink(env: Env, admin: Address, sink: Address) -> Result<Symbol, Error> {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        Self::assert_admin(&env, &admin)?;
         env.storage().persistent().set(&StakeDataKey::AuditSink, &sink);
-        symbol_short!("ok")
+        Ok(symbol_short!("ok"))
     }
 
     /// Read the audit-log sink address, if configured.

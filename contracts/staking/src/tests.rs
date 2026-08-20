@@ -1282,14 +1282,16 @@ fn projection_accuracy_1_year() {
     let apr = SCALE / 20; // 5%
     let proj = client_project(principal, apr, CompoundingMode::Daily, SECONDS_PER_YEAR);
     let ref_yield = reference_daily_yield(principal, apr, 365);
-    assert_within_bps(proj.projected_yield, ref_yield, 1);}
+    assert_within_bps(proj.projected_yield, ref_yield, 1);
+}
 
 #[test]
 fn projection_balance_equals_principal_plus_yield() {
     let principal = 500_000_000i128;
     let apr = SCALE / 5; // 20%
     let proj = client_project(principal, apr, CompoundingMode::Continuous, SECONDS_PER_YEAR);
-    assert_eq!(proj.projected_balance, principal + proj.projected_yield);}
+    assert_eq!(proj.projected_balance, principal + proj.projected_yield);
+}
 
 // ---------------------------------------------------------------------------
 // Zero principal edge cases
@@ -1346,7 +1348,8 @@ fn yield_segments_time_weighted_accuracy() {
     assert_eq!(total_yield, balance - principal);
 }
 
-// ---------------------------------------------------------------------------n// Yield claim resets accrued_yield
+// ---------------------------------------------------------------------------
+n// Yield claim resets accrued_yield
 // ---------------------------------------------------------------------------
 
 #[test]

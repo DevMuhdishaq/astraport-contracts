@@ -10,26 +10,29 @@
 //! keep the implementation small. The bucketed indices in [`crate::records`]
 //! remain available for future optimization.
 
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{contracttype, symbol_short, Address, Symbol};
 
 use crate::records::{AuditEventType, AuditLog};
 
 /// Filter set for log queries.
-///
-/// `None` means "any" for that field; `Some(_)` narrows the search.
 #[contracttype]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LogQuery {
     /// Inclusive lower bound on `entry.timestamp`. `0` is treated as unset.
     pub from_ts: u64,
     /// Inclusive upper bound on `entry.timestamp`. `0` is treated as unset.
     pub to_ts: u64,
-    /// Optional event-type filter.
-    pub event_type: Option<AuditEventType>,
-    /// Optional actor filter.
-    pub actor: Option<Address>,
-    /// Optional portfolio filter.
-    pub portfolio: Option<Symbol>,
+    /// Optional event-type filter (stored as u32).
+    pub event_type: Option<u32>,
+    /// Flag indicating whether `actor` filter is active.
+    pub has_actor: bool,
+    /// Actor filter address.
+    pub actor: Address,
+    /// Flag indicating whether `portfolio` filter is active.
+    pub has_portfolio: bool,
+    /// Portfolio filter symbol.
+    pub portfolio: Symbol,
     /// Maximum number of entries returned.
     pub limit: u32,
     /// Reserved for future use (e.g. cursor-based pagination).
@@ -43,8 +46,10 @@ impl LogQuery {
             from_ts: 0,
             to_ts: 0,
             event_type: None,
-            actor: None,
-            portfolio: None,
+            has_actor: false,
+            actor: Address::generate(&soroban_sdk::Env::default()),
+            has_portfolio: false,
+            portfolio: symbol_short!("none"),
             limit,
             cursor: 0,
         }
@@ -64,19 +69,21 @@ impl LogQuery {
 
     /// Restrict the query to a single event type.
     pub fn event_type(mut self, t: AuditEventType) -> Self {
-        self.event_type = Some(t);
+        self.event_type = Some(t as u32);
         self
     }
 
     /// Restrict the query to a single actor.
     pub fn actor(mut self, a: Address) -> Self {
-        self.actor = Some(a);
+        self.has_actor = true;
+        self.actor = a;
         self
     }
 
     /// Restrict the query to a single portfolio.
     pub fn portfolio(mut self, p: Symbol) -> Self {
-        self.portfolio = Some(p);
+        self.has_portfolio = true;
+        self.portfolio = p;
         self
     }
 
@@ -94,22 +101,16 @@ impl LogQuery {
         if self.to_ts != 0 && entry.timestamp > self.to_ts {
             return false;
         }
-        if let Some(t) = &self.event_type {
-            if entry.event_type != *t {
+        if let Some(t) = self.event_type {
+            if (entry.event_type as u32) != t {
                 return false;
             }
         }
-        if let Some(a) = &self.actor {
-            // Compare via the SDK's address stringification (sufficient for
-            // exact equality on Soroban contract addresses).
-            if entry.actor.to_string() != a.to_string() {
-                return false;
-            }
+        if self.has_actor && entry.actor != self.actor {
+            return false;
         }
-        if let Some(p) = &self.portfolio {
-            if entry.portfolio != *p {
-                return false;
-            }
+        if self.has_portfolio && entry.portfolio != self.portfolio {
+            return false;
         }
         true
     }
