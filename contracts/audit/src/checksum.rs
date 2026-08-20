@@ -13,35 +13,44 @@
 //! provides equivalent collision-resistance and runs natively in the host,
 //! keeping per-log cost predictable.
 
-use soroban_sdk::{Address, Bytes, BytesN, Env, String, Symbol};
+use soroban_sdk::{Address, Bytes, BytesN, Env, IntoVal, String, Symbol};
 
-use crate::records::{AuditLog, StateSnapshot, CHAIN_ORIGIN};
+use crate::records::{StateSnapshot, CHAIN_ORIGIN};
 
-/// Decode a `String` to a `Vec<u8>`-shaped `Bytes` by walking its
-/// (char-by-char) representation. Soroban's `String` is backed by a
-/// buffer of `u8`s, so this yield is the storage-format bytes.
+/// Helper: copy a Soroban `String` into a heap `alloc::string::String`.
+fn soroban_string_to_rust(s: &String) -> alloc::string::String {
+    let len = s.len() as usize;
+    let mut buf = alloc::vec![0u8; len];
+    s.copy_into_slice(&mut buf);
+    // SAFETY: Soroban strings are validated UTF-8 at construction time.
+    unsafe { alloc::string::String::from_utf8_unchecked(buf) }
+}
+
+/// Encode a Soroban `String` into `Bytes`.
 fn string_bytes(env: &Env, s: &String) -> Bytes {
-    let mut out = Bytes::new(env);
-    // Soroban's String iter() yields chars; for the hash we accept this
-    // platform representation and append each char as u8 truncating any
-    // multi-byte chars. Strictly unfit for non-ASCII, but real audit
-    // `detail` strings are ASCII in practice.
-    for c in s.iter() {
-        out.push_back(c as u8);
-    }
-    out
+    let len = s.len();
+    let mut buf = alloc::vec![0u8; len as usize];
+    s.copy_into_slice(&mut buf);
+    Bytes::from_slice(env, &buf)
 }
 
-/// Decode a `Symbol` to a `Bytes` via its string representation.
+/// Encode a `Symbol` into `Bytes` via its XDR representation.
 fn symbol_bytes(env: &Env, s: &Symbol) -> Bytes {
-    let str = s.to_string();
-    string_bytes(env, &str)
+    // Convert Symbol → ScVal → ScSymbol, then extract raw bytes.
+    let sc_val: soroban_sdk::xdr::ScVal = s.clone().into_val(env);
+    if let soroban_sdk::xdr::ScVal::Symbol(sc_sym) = sc_val {
+        let raw: &[u8] = sc_sym.as_ref();
+        Bytes::from_slice(env, raw)
+    } else {
+        Bytes::new(env)
+    }
 }
 
-/// Decode an `Address` to a `Bytes` via its string representation.
+/// Encode an `Address` into `Bytes` via its string representation.
 fn address_bytes(env: &Env, a: &Address) -> Bytes {
-    let str = a.to_string();
-    string_bytes(env, &str)
+    // Address::to_string() returns a Soroban String; convert that to bytes.
+    let s: String = a.to_string();
+    string_bytes(env, &s)
 }
 
 /// Decode a `StateSnapshot` to a `Bytes`. We serialize `len` first then each
@@ -77,12 +86,24 @@ pub fn entry_payload(
     b.append(&Bytes::from_array(env, &timestamp.to_be_bytes()));
     b.append(&Bytes::from_array(env, &event_type_id.to_be_bytes()));
     b.append(&Bytes::from_array(env, &permissions.to_be_bytes()));
-    b.append(&env.crypto().sha256(&address_bytes(env, actor)));
-    b.append(&env.crypto().sha256(&symbol_bytes(env, portfolio)));
-    b.append(&env.crypto().sha256(&symbol_bytes(env, outcome)));
-    b.append(&env.crypto().sha256(&string_bytes(env, detail)));
-    b.append(&env.crypto().sha256(&snapshot_bytes(env, state_before)));
-    b.append(&env.crypto().sha256(&snapshot_bytes(env, state_after)));
+    let h1: BytesN<32> = env.crypto().sha256(&address_bytes(env, actor)).into();
+    b.append(&h1.into());
+    let h2: BytesN<32> = env.crypto().sha256(&symbol_bytes(env, portfolio)).into();
+    b.append(&h2.into());
+    let h3: BytesN<32> = env.crypto().sha256(&symbol_bytes(env, outcome)).into();
+    b.append(&h3.into());
+    let h4: BytesN<32> = env.crypto().sha256(&string_bytes(env, detail)).into();
+    b.append(&h4.into());
+    let h5: BytesN<32> = env
+        .crypto()
+        .sha256(&snapshot_bytes(env, state_before))
+        .into();
+    b.append(&h5.into());
+    let h6: BytesN<32> = env
+        .crypto()
+        .sha256(&snapshot_bytes(env, state_after))
+        .into();
+    b.append(&h6.into());
     b
 }
 
@@ -91,7 +112,7 @@ pub fn chain_hash(env: &Env, prev_hash: &BytesN<32>, payload: &Bytes) -> BytesN<
     let mut buf = Bytes::new(env);
     buf.append(&Bytes::from_array(env, &prev_hash.to_array()));
     buf.append(payload);
-    env.crypto().sha256(&buf)
+    env.crypto().sha256(&buf).into()
 }
 
 /// The chain hash for the very first entry (`prev_hash == CHAIN_ORIGIN`).
