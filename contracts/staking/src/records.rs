@@ -5,7 +5,7 @@
 //! pure-math results from [`crate::compounding`] and [`crate::apy`] into durable,
 //! queryable structures keyed by staker and asset.
 
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 /// The compounding model, mirrored as a `#[contracttype]` for storage.
 ///
@@ -214,6 +214,10 @@ pub enum StakeDataKey {
     /// with non-zero balance. Used internally to transition the
     /// [`StakeDataKey::ActiveStakerCount`] on full exits.
     StakerPositionCount(Address),
+    /// The [`StakingPosition`] for a `(staker, asset)` pair.
+    Position(Address, Symbol),
+    /// The list of asset symbols a staker is currently staked in.
+    StakerAssets(Address),
     /// Optional audit-log sink address. When set, the staking contract
     /// invokes the audit contract on every state-changing event.
     AuditSink,

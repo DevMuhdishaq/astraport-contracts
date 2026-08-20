@@ -13,7 +13,7 @@
 //! provides equivalent collision-resistance and runs natively in the host,
 //! keeping per-log cost predictable.
 
-use soroban_sdk::{Address, Bytes, BytesN, Env, IntoVal, String, Symbol};
+use soroban_sdk::{FromVal, Address, Bytes, BytesN, Env, IntoVal, String, Symbol};
 
 use crate::records::{StateSnapshot, CHAIN_ORIGIN};
 

@@ -60,6 +60,8 @@ pub enum Error {
     InvalidEvent = 3,
     /// Prune failed because the retention policy is unbounded.
     NoRetentionPolicy = 4,
+    /// Contract was already initialized.
+    AlreadyInitialized = 5,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,16 +80,16 @@ impl AuditContract {
     // -----------------------------------------------------------------------
 
     /// Initialize the contract with an admin address. May only be called once.
-    pub fn initialize(env: Env, admin: Address) -> Symbol {
+    pub fn initialize(env: Env, admin: Address) -> Result<Symbol, Error> {
         let key = StorageKey::Admin;
         if env.storage().persistent().has(&key) {
-            panic!("already initialized");
+            return Err(Error::AlreadyInitialized);
         }
         env.storage().persistent().set(&key, &admin);
         env.storage().persistent().set(&StorageKey::NextSeq, &0u64);
         env.storage().persistent().set(&StorageKey::EntryCount, &0u64);
-        env.storage().persistent().set(&StorageKey::FirstSeq, &0u64);
-        OK
+        env.storage().persistent().set(&StorageKey::FirstSeq, &1u64);
+        Ok(OK)
     }
 
     /// Return the current admin. Errors if uninitialized.
@@ -108,7 +110,7 @@ impl AuditContract {
         admin: Address,
         policy: RetentionPolicy,
     ) -> Result<Symbol, Error> {
-        Self::assert_admin(&env, &admin);
+        Self::assert_admin(&env, &admin)?;
         env.storage()
             .persistent()
             .set(&StorageKey::RetentionPolicy, &policy);
@@ -346,7 +348,7 @@ impl AuditContract {
     ///
     /// Returns the number of entries pruned.
     pub fn prune_old(env: Env, admin: Address) -> Result<u32, Error> {
-        Self::assert_admin(&env, &admin);
+        Self::assert_admin(&env, &admin)?;
         let policy = Self::get_retention_policy(env.clone());
         if policy.is_unbounded() {
             return Err(Error::NoRetentionPolicy);
@@ -397,10 +399,11 @@ impl AuditContract {
         }
 
         if count_limit > 0 {
-            let current_total = total - prune_count as u64;
-            while current_total - prune_count as u64 + 1 > count_limit {
+            let mut remaining = total - prune_count as u64;
+            while remaining > count_limit {
                 new_first += 1;
                 prune_count += 1;
+                remaining -= 1;
             }
         }
 
@@ -483,14 +486,17 @@ impl AuditContract {
 // ---------------------------------------------------------------------------
 
 impl AuditContract {
-    fn assert_admin(env: &Env, admin: &Address) {
+    fn assert_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         let stored: Address = env
             .storage()
             .persistent()
             .get(&StorageKey::Admin)
-            .expect("contract not initialized");
-        assert!(*admin == stored, "unauthorized: caller is not admin");
+            .ok_or(Error::NotInitialized)?;
+        if *admin != stored {
+            return Err(Error::Unauthorized);
+        }
         admin.require_auth();
+        Ok(())
     }
 
     /// Append one sequence id to a bucket's index.

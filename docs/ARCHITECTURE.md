@@ -2,25 +2,74 @@
 
 ## Overview
 
-AstraPort Smart Contracts is a suite of Soroban-based smart contracts built on the Stellar blockchain. The contracts enable decentralized portfolio management with features for rebalancing, event-driven actions, and staking.
+AstraPort Smart Contracts is a suite of Soroban-based smart contracts built on the Stellar blockchain. The contracts enable decentralized portfolio management with features for rebalancing, event-driven actions, staking, and role-based access control.
 
 ## Architecture
 
 ### Contract Modules
 
 #### 1. Rebalancing Contract
-- **Purpose**: Manages portfolio rebalancing and allocation adjustments with portfolio-level ownership and access control
+- **Purpose**: Manages portfolio rebalancing and allocation adjustments with RBAC-secured portfolio-level access control
 - **Key Functions**:
   - `initialize()` - Initialize the contract
-  - `set_target_allocation(owner, portfolio_id, allocation)` - Set target allocation (owner auth required)
-  - `set_schedule(owner, portfolio_id, interval)` - Set rebalancing schedule (owner auth required)
-  - `rebalance(owner, portfolio_id)` - Execute manual portfolio rebalancing (owner auth required)
+  - `set_target_allocation(owner, portfolio_id, allocation)` - Set target allocation (owner or MANAGER role required)
+  - `set_current_holdings(owner, portfolio_id, holdings)` - Set current holdings (owner or MANAGER role required)
+  - `set_schedule(owner, portfolio_id, interval)` - Set rebalancing schedule (owner or MANAGER role required)
+  - `rebalance(owner, portfolio_id)` - Execute manual portfolio rebalancing (owner or MANAGER role required)
+  - `execute_rebalance(owner, portfolio_id, strategy)` - Execute rebalance with strategy (owner or MANAGER role required)
+  - `set_drift_threshold_bps(owner, portfolio_id, threshold)` - Set drift tolerance (owner or MANAGER role required)
   - `get_owner(portfolio_id)` - Query portfolio owner address
   - `get_status(portfolio_id)` - Query rebalancing status
+  - `grant_role(granter, portfolio_id, assignee, role, expires_at)` - Assign RBAC role
+  - `revoke_role(revoker, portfolio_id, assignee)` - Revoke RBAC role
+  - `check_permission_rbac(portfolio_id, actor, permission)` - Check RBAC permissions
+  - `get_access_log(portfolio_id)` - Retrieve permission check audit log
 - **Use Cases**:
   - Automated portfolio rebalancing
   - Target allocation management
   - Drift correction
+  - Delegated portfolio management via RBAC
+
+##### Role-Based Access Control (RBAC)
+
+The rebalancing contract implements a comprehensive RBAC system enabling portfolio owners to delegate specific permissions to other accounts.
+
+**Roles:**
+
+| Role       | Description                                      | Default Permissions                                                                 |
+|------------|--------------------------------------------------|-------------------------------------------------------------------------------------|
+| Owner      | Full control over portfolio                      | ALL permissions                                                                     |
+| Manager    | Can modify allocations and trigger rebalancing   | VIEW + MODIFY_ALLOCATIONS + REBALANCE + MANAGE_SCHEDULE + EXECUTE_REBALANCE         |
+| Viewer     | Read-only access to portfolio data               | VIEW                                                                                |
+| Liquidator | Emergency withdrawal only                        | VIEW + LIQUIDATE                                                                    |
+
+**Permission Bitmask Constants:**
+
+| Constant               | Bit   | Description                                    |
+|------------------------|-------|------------------------------------------------|
+| `CAN_VIEW`            | 0x01  | Read portfolio data                            |
+| `CAN_MODIFY_ALLOCATIONS` | 0x02 | Modify target allocation, holdings, drift    |
+| `CAN_REBALANCE`       | 0x04  | Trigger manual rebalancing                     |
+| `CAN_MANAGE_SCHEDULE` | 0x08  | Set, update, or cancel rebalancing schedules   |
+| `CAN_EXECUTE_REBALANCE` | 0x10 | Execute rebalance with execution strategy    |
+| `CAN_LIQUIDATE`       | 0x20  | Emergency withdrawal                           |
+| `CAN_MANAGE_ROLES`    | 0x40  | Assign and revoke roles                        |
+| `CAN_CONFIGURE`       | 0x80  | Configure system settings (audit sink, etc.)   |
+
+**Role Inheritance:**
+- Manager ⊇ Viewer: Manager includes all Viewer permissions
+- Owner inherits all permissions from every other role
+
+**Time-Limited Roles:**
+Roles can be assigned with an optional expiry timestamp. Once the ledger timestamp exceeds the expiry, the role is automatically considered revoked. `expires_at = 0` means the role never expires.
+
+**Access Logging:**
+Every permission check is recorded in an append-only access log per portfolio, including:
+- Actor address
+- Required permission
+- Actor's actual permissions
+- Whether access was granted or denied
+- Action name and timestamp
 
 #### 2. Events Contract
 - **Purpose**: Emits and manages events on portfolio changes
@@ -28,7 +77,7 @@ AstraPort Smart Contracts is a suite of Soroban-based smart contracts built on t
   - `initialize()` - Initialize the contract
   - `emit_event()` - Trigger portfolio change events
   - `subscribe()` - Subscribe to portfolio events
-  - `unsubscribe()` - Unsubscribe from events
+  - `unsubscribe()` - Unsubscribe from portfolio events
 - **Use Cases**:
   - Portfolio change notifications
   - AI analysis triggers
@@ -84,6 +133,15 @@ Financial formulas:
 - Continuous growth factor: `e^(r·t)`.
 - APY: `(1 + r/365)^365 − 1` (daily) or `e^r − 1` (continuous).
 
+#### 4. Audit Contract
+- **Purpose**: Immutable, append-only audit log for portfolio events with tamper detection via SHA-256 chain hash
+- **Key Functions**:
+  - `initialize(admin)` - Initialize with admin address
+  - `log_event(actor, event_type, portfolio, permissions, ...)` - Append audit entry
+  - `query(log_query)` - Filter and retrieve audit entries
+  - `verify_integrity(expected_head)` - Verify chain hash integrity
+  - `prune_old(admin)` - Enforce retention policy
+
 ## Technology Stack
 
 - **Language**: Rust
@@ -105,5 +163,7 @@ soroban contract build --package astraport-staking
 
 - All contracts use no_std to minimize attack surface
 - Input validation is required for all public functions
-- Implement access control mechanisms for sensitive operations
+- Role-based access control enforces security boundaries on all state-changing functions
+- Unauthorized access attempts are logged for audit purposes
+- Time-limited roles expire automatically for defense in depth
 - Regular audits recommended before mainnet deployment
