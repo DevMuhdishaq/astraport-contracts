@@ -229,8 +229,8 @@ pub struct AITrigger {
 
 /// Condition to evaluate against current values.
 pub struct TriggerCondition {
-    pub current_value: U256,
-    pub threshold: U256,
+    pub current_value: i128,
+    pub threshold: i128,
     pub operator: ComparisonOperator,
 }
 
@@ -241,7 +241,7 @@ impl TriggerEvaluator {
     pub fn evaluate(
         trigger: &AITrigger,
         event_type: EventType,
-        current_value: Option<U256>,
+        current_value: Option<i128>,
     ) -> bool {
         let event_type_matches = trigger.event_types.contains(event_type as u32);
         if !event_type_matches {
