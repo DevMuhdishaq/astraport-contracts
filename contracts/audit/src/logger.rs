@@ -10,7 +10,7 @@
 
 extern crate alloc;
 
-use soroban_sdk::{symbol_short, Address, Env, String, Symbol, Vec};
+use soroban_sdk::{symbol_short, Address, Env, IntoVal, String, Symbol, Vec};
 
 use crate::records::{AuditEventType, AuditLog, StateSnapshot};
 
@@ -50,35 +50,31 @@ impl<'a> AuditLogger<'a> {
         detail: String,
     ) -> u64 {
         let fn_name = symbol_short!("log_event");
-        let res: Result<u64, soroban_sdk::InvokeError> = self.env.invoke_contract(
-            &self.contract,
-            &fn_name,
-            (
-                actor,
-                event_type,
-                portfolio,
-                permissions,
-                state_before,
-                state_after,
-                outcome,
-                detail,
-            ),
-        );
-        // If the audit call fails (e.g. contract paused) we panic to surface
-        // the breakage loudly rather than silently dropping events. Off-chain
-        // monitors rely on every state change being auditable.
-        match res {
-            Ok(seq) => seq,
-            Err(e) => panic!("audit log failure: {:?}", e),
-        }
+        let args: Vec<soroban_sdk::Val> = (
+            actor,
+            event_type,
+            portfolio,
+            permissions,
+            state_before,
+            state_after,
+            outcome,
+            detail,
+        )
+            .into_val(self.env);
+        // invoke_contract returns T directly; panics on failure.
+        self.env
+            .invoke_contract::<u64>(&self.contract, &fn_name, args)
     }
 
     /// Query the audit log via the contract. Used for cross-contract
     /// verification requests (e.g. compliance reconciliation).
     pub fn query(&self) -> Vec<AuditLog> {
         let fn_name = symbol_short!("query");
-        self.env
-            .invoke_contract::<Vec<AuditLog>>(&self.contract, &fn_name, ())
-            .expect("audit query call failed")
+        let empty_args: Vec<soroban_sdk::Val> = Vec::new(self.env);
+        self.env.invoke_contract::<Vec<AuditLog>>(
+            &self.contract,
+            &fn_name,
+            empty_args,
+        )
     }
 }
