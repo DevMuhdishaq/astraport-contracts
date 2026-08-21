@@ -16,7 +16,8 @@ use soroban_sdk::{Address, Env, Symbol, Vec};
 use crate::compounding::YieldCalculator;
 use crate::fixed_point::MathError;
 use crate::records::{
-    CompoundingMode, DistributionSchedule, YieldDataKey, YieldHistoryEntry, YieldRecord,
+    CompoundingMode, DistributionSchedule, DistributionType, YieldDataKey,
+    YieldDistributionRecord, YieldHistoryEntry, YieldRecord,
 };
 
 /// Stateful engine coordinating yield accrual, history, and distributions.
@@ -289,38 +290,6 @@ impl<'a> YieldEngine<'a> {
             .unwrap_or_else(|| Vec::new(self.env))
     }
 
-    /// Process due distributions for a pair as of the current ledger time.
-    ///
-    /// Returns the total amount marked due. One-off schedules are marked
-    /// `executed`; recurring schedules have their `due_ts` advanced by their
-    /// interval and remain active.
-    pub fn process_distribution(&self, staker: &Address, asset: &Symbol) -> i128 {
-        let now = self.env.ledger().timestamp();
-        let key = YieldDataKey::Schedule(staker.clone(), asset.clone());
-        let list: Vec<DistributionSchedule> = match self.env.storage().persistent().get(&key) {
-            Some(l) => l,
-            None => return 0,
-        };
-
-        let mut total: i128 = 0;
-        let mut updated: Vec<DistributionSchedule> = Vec::new(self.env);
-        for i in 0..list.len() {
-            let mut s = list.get(i).unwrap();
-            if !s.executed && s.due_ts <= now {
-                total += s.amount;
-                if s.interval_seconds > 0 {
-                    // Recurring: advance to the next due time, stay active.
-                    s.due_ts += s.interval_seconds;
-                } else {
-                    s.executed = true;
-                }
-            }
-            updated.push_back(s);
-        }
-        self.env.storage().persistent().set(&key, &updated);
-        total
-    }
-
     // --- record persistence ---------------------------------------------
 
     /// Load the active record for a pair, if any.
@@ -333,5 +302,443 @@ impl<'a> YieldEngine<'a> {
     fn store_record(&self, record: &YieldRecord) {
         let key = YieldDataKey::Record(record.staker.clone(), record.asset.clone());
         self.env.storage().persistent().set(&key, record);
+    }
+
+    // --- yield escrow / reserve ---------------------------------------
+
+    /// Fund the yield reserve for an asset.
+    ///
+    /// Increases [`YieldDataKey::ReserveBalance`] by `amount`. The caller
+    /// is responsible for the actual token transfer; this only updates the
+    /// bookkeeping.
+    pub fn fund_reserve(&self, asset: &Symbol, amount: i128) -> i128 {
+        assert!(amount > 0, "ReserveFundAmountMustBePositive");
+        let key = YieldDataKey::ReserveBalance(asset.clone());
+        let current: i128 = self.env.storage().persistent().get(&key).unwrap_or_default();
+        let new_balance = current
+            .checked_add(amount)
+            .expect("ReserveBalance overflow");
+        self.env.storage().persistent().set(&key, &new_balance);
+        new_balance
+    }
+
+    /// Return the current yield reserve balance for an asset.
+    pub fn reserve_balance(&self, asset: &Symbol) -> i128 {
+        let key = YieldDataKey::ReserveBalance(asset.clone());
+        self.env.storage().persistent().get(&key).unwrap_or_default()
+    }
+
+    /// Withdraw from the yield reserve (admin-only caller verified in lib.rs).
+    ///
+    /// Decreases the reserve by `amount` and returns the new balance.
+    /// Panics if the reserve is insufficient.
+    pub fn withdraw_reserve(&self, asset: &Symbol, amount: i128) -> i128 {
+        assert!(amount > 0, "ReserveWithdrawAmountMustBePositive");
+        let key = YieldDataKey::ReserveBalance(asset.clone());
+        let current: i128 = self.env.storage().persistent().get(&key).unwrap_or_default();
+        assert!(current >= amount, "InsufficientReserve");
+        let new_balance = current - amount;
+        self.env.storage().persistent().set(&key, &new_balance);
+        new_balance
+    }
+
+
+    // --- pause / unpause -----------------------------------------------
+
+    /// Return `true` if distributions are globally paused.
+    pub fn is_paused(&self) -> bool {
+        self.env
+            .storage()
+            .persistent()
+            .get(&YieldDataKey::DistributionsPaused)
+            .unwrap_or(false)
+    }
+
+    /// Set the global pause flag. Admin-only caller verified in lib.rs.
+    pub fn set_paused(&self, paused: bool) {
+        self.env
+            .storage()
+            .persistent()
+            .set(&YieldDataKey::DistributionsPaused, &paused);
+    }
+
+    // --- distribution history ------------------------------------------
+
+    /// Append a [`YieldDistributionRecord`] to the per-pair history log.
+    pub fn record_distribution(
+        &self,
+        record: &YieldDistributionRecord,
+    ) {
+        let key = YieldDataKey::DistributionHistory(
+            record.staker.clone(),
+            record.asset.clone(),
+        );
+        let mut log: Vec<YieldDistributionRecord> = self
+            .env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(self.env));
+        log.push_back(record.clone());
+        self.env.storage().persistent().set(&key, &log);
+    }
+
+    /// Full distribution history for a `(staker, asset)` pair, oldest first.
+    pub fn distribution_history(
+        &self,
+        staker: &Address,
+        asset: &Symbol,
+    ) -> Vec<YieldDistributionRecord> {
+        let key = YieldDataKey::DistributionHistory(staker.clone(), asset.clone());
+        self.env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(self.env))
+    }
+
+    /// Distribution history for a `(staker, asset)` pair filtered by time
+    /// range `[from_ts, to_ts]` (inclusive).
+    pub fn distribution_history_range(
+        &self,
+        staker: &Address,
+        asset: &Symbol,
+        from_ts: u64,
+        to_ts: u64,
+    ) -> Vec<YieldDistributionRecord> {
+        let all = self.distribution_history(staker, asset);
+        let mut filtered: Vec<YieldDistributionRecord> = Vec::new(self.env);
+        for i in 0..all.len() {
+            let entry = all.get(i).unwrap();
+            if entry.timestamp >= from_ts && entry.timestamp <= to_ts {
+                filtered.push_back(entry);
+            }
+        }
+        filtered
+    }
+
+    /// Distribution history for a `(staker, asset)` pair filtered by type.
+    pub fn distribution_history_by_type(
+        &self,
+        staker: &Address,
+        asset: &Symbol,
+        dist_type: DistributionType,
+    ) -> Vec<YieldDistributionRecord> {
+        let all = self.distribution_history(staker, asset);
+        let mut filtered: Vec<YieldDistributionRecord> = Vec::new(self.env);
+        for i in 0..all.len() {
+            let entry = all.get(i).unwrap();
+            if entry.distribution_type == dist_type {
+                filtered.push_back(entry);
+            }
+        }
+        filtered
+    }
+
+    /// Total yield claimed by a staker for an asset, across all distributions.
+    pub fn total_yield_claimed(&self, staker: &Address, asset: &Symbol) -> i128 {
+        let history = self.distribution_history(staker, asset);
+        let mut total: i128 = 0;
+        for i in 0..history.len() {
+            let entry = history.get(i).unwrap();
+            total = total
+                .checked_add(entry.amount)
+                .expect("total_yield_claimed overflow");
+        }
+        total
+    }
+
+    // --- partial claims ------------------------------------------------
+
+    /// Claim a specific `amount` of yield from a position.
+    ///
+    /// The position is accrued to `now` first. If `amount` exceeds accrued
+    /// yield, the full accrued amount is claimed. Returns the actual amount
+    /// claimed.
+    ///
+    /// The reserve is checked: if a reserve exists for the asset and has
+    /// insufficient balance, the claim is capped to the available reserve.
+    pub fn claim_yield_partial(
+        &self,
+        staker: &Address,
+        asset: &Symbol,
+        amount: i128,
+    ) -> Result<i128, MathError> {
+        assert!(amount > 0, "ClaimAmountMustBePositive");
+        let record = self
+            .load_record(staker, asset)
+            .ok_or(MathError::NegativeInput)?;
+        let now = self.env.ledger().timestamp();
+        let updated = self.accrue_to(&record, now)?;
+        let available = updated.accrued_yield;
+
+        // Cap to available accrued yield.
+        let mut claimed = if amount > available {
+            available
+        } else {
+            amount
+        };
+
+        // If reserve exists, cap to reserve balance.
+        let reserve_key = YieldDataKey::ReserveBalance(asset.clone());
+        let reserve: i128 = self
+            .env
+            .storage()
+            .persistent()
+            .get(&reserve_key)
+            .unwrap_or(-1);
+        if reserve >= 0 && claimed > reserve {
+            claimed = reserve;
+        }
+
+        if claimed <= 0 {
+            return Ok(0);
+        }
+
+        // Deduct from reserve if one exists.
+        if reserve >= 0 {
+            self.env
+                .storage()
+                .persistent()
+                .set(&reserve_key, &(reserve - claimed));
+        }
+
+        // Finalize: deduct from accrued, record history.
+        let mut finalized = updated.clone();
+        finalized.accrued_yield -= claimed;
+        self.append_history(
+            staker,
+            asset,
+            YieldHistoryEntry {
+                timestamp: now,
+                period_seconds: 0,
+                apr: finalized.apr,
+                yield_earned: 0,
+                cumulative_yield: finalized.accrued_yield,
+                is_claim: true,
+            },
+        );
+        self.store_record(&finalized);
+
+        // Record the distribution.
+        let remaining_reserve = self.reserve_balance(asset);
+        self.record_distribution(&YieldDistributionRecord {
+            staker: staker.clone(),
+            asset: asset.clone(),
+            amount: claimed,
+            timestamp: now,
+            distribution_type: DistributionType::Claim,
+            accrued_at_claim: available,
+            reserve_after: remaining_reserve,
+        });
+
+        Ok(claimed)
+    }
+
+    // --- batch claims ---------------------------------------------------
+
+    /// Claim yield for multiple stakers on a single asset in one call.
+    ///
+    /// Gas optimization: accrual is done once per staker, and distribution
+    /// records are written in a tight loop. Each staker claims all their
+    /// accrued yield (full claim, not partial).
+    ///
+    /// Returns a `Vec` of `(staker, claimed_amount)` pairs.
+    pub fn batch_claim(
+        &self,
+        stakers: &Vec<Address>,
+        asset: &Symbol,
+    ) -> Vec<(Address, i128)> {
+        let now = self.env.ledger().timestamp();
+        let mut results: Vec<(Address, i128)> = Vec::new(self.env);
+
+        // Check if distributions are paused.
+        if self.is_paused() {
+            for i in 0..stakers.len() {
+                let staker = stakers.get(i).unwrap();
+                results.push_back((staker, 0));
+            }
+            return results;
+        }
+
+        // Reserve check: if reserve exists, compute total available.
+        let reserve_key = YieldDataKey::ReserveBalance(asset.clone());
+        let mut reserve_remaining: i128 = self
+            .env
+            .storage()
+            .persistent()
+            .get(&reserve_key)
+            .unwrap_or(-1);
+        let has_reserve = reserve_remaining >= 0;
+
+        for i in 0..stakers.len() {
+            let staker = stakers.get(i).unwrap();
+            let record = match self.load_record(&staker, asset) {
+                Some(r) => r,
+                None => {
+                    results.push_back((staker, 0));
+                    continue;
+                }
+            };
+
+            let updated = match self.accrue_to(&record, now) {
+                Ok(r) => r,
+                Err(_) => {
+                    results.push_back((staker, 0));
+                    continue;
+                }
+            };
+
+            let available = updated.accrued_yield;
+            if available <= 0 {
+                results.push_back((staker, 0));
+                continue;
+            }
+
+            let mut claimed = available;
+
+            // Cap to reserve if one exists.
+            if has_reserve && claimed > reserve_remaining {
+                claimed = reserve_remaining;
+            }
+
+            if claimed <= 0 {
+                results.push_back((staker, 0));
+                continue;
+            }
+
+            // Deduct from reserve.
+            if has_reserve {
+                reserve_remaining -= claimed;
+            }
+
+            // Finalize the claim.
+            let mut finalized = updated.clone();
+            finalized.accrued_yield -= claimed;
+            self.append_history(
+                &staker,
+                asset,
+                YieldHistoryEntry {
+                    timestamp: now,
+                    period_seconds: 0,
+                    apr: finalized.apr,
+                    yield_earned: 0,
+                    cumulative_yield: finalized.accrued_yield,
+                    is_claim: true,
+                },
+            );
+            self.store_record(&finalized);
+
+            // Record the distribution.
+            self.record_distribution(&YieldDistributionRecord {
+                staker: staker.clone(),
+                asset: asset.clone(),
+                amount: claimed,
+                timestamp: now,
+                distribution_type: DistributionType::BatchClaim,
+                accrued_at_claim: available,
+                reserve_after: reserve_remaining,
+            });
+
+            results.push_back((staker, claimed));
+        }
+
+        // Persist the updated reserve.
+        if has_reserve {
+            self.env
+                .storage()
+                .persistent()
+                .set(&reserve_key, &reserve_remaining);
+        }
+
+        results
+    }
+
+    // --- enhanced distribution processing --------------------------------
+
+    /// Process due distributions for a pair as of the current ledger time,
+    /// with reserve-solvency checks.
+    ///
+    /// If distributions are paused, returns `0` without modifying state.
+    /// If a reserve is configured and insufficient for a distribution, that
+    /// distribution is skipped.
+    ///
+    /// Returns the total amount marked due. One-off schedules are marked
+    /// `executed`; recurring schedules have their `due_ts` advanced by their
+    /// interval and remain active.
+    pub fn process_distribution(&self, staker: &Address, asset: &Symbol) -> i128 {
+        let now = self.env.ledger().timestamp();
+
+        // Block all distributions when paused.
+        if self.is_paused() {
+            return 0;
+        }
+
+        let key = YieldDataKey::Schedule(staker.clone(), asset.clone());
+        let list: Vec<DistributionSchedule> = match self.env.storage().persistent().get(&key) {
+            Some(l) => l,
+            None => return 0,
+        };
+
+        let reserve_key = YieldDataKey::ReserveBalance(asset.clone());
+        let mut reserve: i128 = self
+            .env
+            .storage()
+            .persistent()
+            .get(&reserve_key)
+            .unwrap_or(-1);
+        let has_reserve = reserve >= 0;
+
+        let mut total: i128 = 0;
+        let mut updated: Vec<DistributionSchedule> = Vec::new(self.env);
+        for i in 0..list.len() {
+            let mut s = list.get(i).unwrap();
+            if !s.executed && s.due_ts <= now {
+                // Reserve-solvency check.
+                let can_pay = if has_reserve {
+                    reserve >= s.amount
+                } else {
+                    true
+                };
+
+                if can_pay {
+                    total += s.amount;
+                    if has_reserve {
+                        reserve -= s.amount;
+                    }
+
+                    // Record the distribution.
+                    self.record_distribution(&YieldDistributionRecord {
+                        staker: staker.clone(),
+                        asset: asset.clone(),
+                        amount: s.amount,
+                        timestamp: now,
+                        distribution_type: DistributionType::Scheduled,
+                        accrued_at_claim: s.amount,
+                        reserve_after: reserve,
+                    });
+
+                    if s.interval_seconds > 0 {
+                        s.due_ts += s.interval_seconds;
+                    } else {
+                        s.executed = true;
+                    }
+                }
+                // If reserve is insufficient, the schedule stays pending
+                // (not executed, not advanced) so it can be retried later.
+            }
+            updated.push_back(s);
+        }
+        self.env.storage().persistent().set(&key, &updated);
+
+        // Persist updated reserve.
+        if has_reserve {
+            self.env
+                .storage()
+                .persistent()
+                .set(&reserve_key, &reserve);
+        }
+
+        total
     }
 }

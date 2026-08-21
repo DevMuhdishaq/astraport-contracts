@@ -17,7 +17,7 @@ pub fn example_rebalance_portfolio() {
     // Portfolio: [40% Asset A, 30% Asset B, 30% Asset C]
     
     // 3. Trigger rebalancing
-    // client.rebalance(&portfolio_id);
+    // client.rebalance(&owner_address, &portfolio_id);
 
     // 4. Check status
     // let status = client.get_status(&portfolio_id);

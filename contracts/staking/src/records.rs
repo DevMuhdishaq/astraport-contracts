@@ -5,7 +5,7 @@
 //! pure-math results from [`crate::compounding`] and [`crate::apy`] into durable,
 //! queryable structures keyed by staker and asset.
 
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 /// The compounding model, mirrored as a `#[contracttype]` for storage.
 ///
@@ -38,6 +38,10 @@ impl CompoundingMode {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Core yield records
+// ---------------------------------------------------------------------------
 
 /// A staker's active yield-accruing position for a single asset.
 ///
@@ -123,6 +127,28 @@ pub struct DistributionSchedule {
     pub executed: bool,
 }
 
+/// Describes the lock-up parameters for a staker's position.
+///
+/// When a staker creates a locked stake, this record is written to
+/// [`StakeDataKey::LockPosition`]. It is used by the emergency-unstake system to
+/// compute how much of the lock has elapsed and derive the applicable penalty.
+///
+/// A position with `unlock_ts == 0` is treated as unlocked (no lock-up penalty
+/// applies).
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct LockPosition {
+    /// The staker who owns this lock.
+    pub staker: Address,
+    /// Ledger timestamp (seconds) when the lock period started.
+    pub lock_start_ts: u64,
+    /// Ledger timestamp (seconds) when the lock expires and normal unstaking
+    /// is allowed without penalty.
+    pub unlock_ts: u64,
+    /// Total principal locked, in base units.
+    pub locked_amount: i128,
+}
+
 /// Storage keys for the yield engine's persistent data.
 ///
 /// Keeping keys in a single enum avoids stringly-typed lookups and keeps the
@@ -138,8 +164,14 @@ pub enum YieldDataKey {
     Schedule(Address, Symbol),
     /// The contract admin address set during `initialize`.
     Admin,
-    /// The global alert threshold value (legacy simple threshold).
+    /// The alert threshold value.
     AlertThreshold,
+    /// Append-only log of [`YieldDistributionRecord`] for a `(staker, asset)` pair.
+    DistributionHistory(Address, Symbol),
+    /// The yield escrow/reserve balance for an asset.
+    ReserveBalance(Symbol),
+    /// Whether distributions are globally paused.
+    DistributionsPaused,
 }
 
 /// Default yield parameters applied when a position is first opened by a stake.
@@ -159,17 +191,70 @@ pub struct StakingConfig {
 
 /// Storage keys for the staking layer that sits in front of the yield engine.
 ///
-/// These keys are used for staker balances and the global staking configuration.
-/// Alert-specific keys live in [`crate::alerts::AlertDataKey`].
+/// Balances are keyed by `(staker, asset)` so the protocol can track totals
+/// per asset and a distinct-active-staker count globally.
 #[contracttype]
 #[derive(Debug, Clone)]
 pub enum StakeDataKey {
-    /// Staked balance (principal) for a staker address, base units.
-    ///
-    /// The single-address variant is used by the simple stake/unstake path in
-    /// [`crate::StakingContract`]. The two-address+asset variant is available
-    /// for future multi-asset extensions.
-    Balance(Address),
+    /// The current staked balance for a `(staker, asset)` pair, in base units.
+    Balance(Address, Symbol),
     /// The default [`StakingConfig`] used when opening new positions.
     Config,
+    /// The [`LockPosition`] for a staker address, if any.
+    LockPosition(Address),
+    /// Running aggregate of every staker's balance for one asset, in base
+    /// units. Maintained by `stake`/`unstake`/`emergency_unstake`.
+    TotalStaked(Symbol),
+    /// Global count of distinct stakers with at least one non-zero balance
+    /// across any asset. Maintained alongside the per-staker
+    /// [`StakeDataKey::StakerPositionCount`] so the count can be derived
+    /// without scanning storage when a position reaches zero.
+    ActiveStakerCount,
+    /// Number of distinct (staker, asset) positions a staker currently holds
+    /// with non-zero balance. Used internally to transition the
+    /// [`StakeDataKey::ActiveStakerCount`] on full exits.
+    StakerPositionCount(Address),
+    /// The [`StakingPosition`] for a `(staker, asset)` pair.
+    Position(Address, Symbol),
+    /// The list of asset symbols a staker is currently staked in.
+    StakerAssets(Address),
+    /// Optional audit-log sink address. When set, the staking contract
+    /// invokes the audit contract on every state-changing event.
+    AuditSink,
+}
+
+/// The type of a yield distribution event, distinguishing claims from
+/// scheduled payouts.
+#[contracttype]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributionType {
+    /// A staker-initiated on-demand claim.
+    Claim,
+    /// A scheduled (recurring or one-off) distribution.
+    Scheduled,
+    /// A batch claim covering multiple stakers in one transaction.
+    BatchClaim,
+}
+
+/// An immutable record of a single yield distribution.
+///
+/// Appended to the per-`(staker, asset)` distribution history log on every
+/// claim or scheduled payout, providing a complete, queryable audit trail.
+#[contracttype]
+#[derive(Debug, Clone)]
+pub struct YieldDistributionRecord {
+    /// The staker who received the distribution.
+    pub staker: Address,
+    /// The asset that was distributed.
+    pub asset: Symbol,
+    /// Base-unit amount distributed to the staker.
+    pub amount: i128,
+    /// Ledger timestamp (seconds) at which the distribution occurred.
+    pub timestamp: u64,
+    /// Whether this was a claim, scheduled payout, or batch claim.
+    pub distribution_type: DistributionType,
+    /// Accrued yield at the time of distribution (before claim reset).
+    pub accrued_at_claim: i128,
+    /// Remaining reserve balance for the asset after this distribution.
+    pub reserve_after: i128,
 }
