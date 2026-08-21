@@ -222,8 +222,12 @@ impl PenaltyCalculator {
         let t = fp::div(elapsed as i128, total as i128)?;
 
         // ratio = end / start  (fixed-point)
-        let start_fp = fp::mul(start, SCALE / BPS_SCALE)?;
-        let end_fp = fp::mul(end, SCALE / BPS_SCALE)?;
+        // Use plain integer multiplication rather than `fp::mul` here. The fixed-
+        // point helper divides by SCALE inside the call, which truncates the
+        // intermediate to 0 for typical BPS values (e.g. start = 4000) and
+        // produces a spurious DivideByZero in the next division.
+        let start_fp = start * (SCALE / BPS_SCALE);
+        let end_fp = end * (SCALE / BPS_SCALE);
         let ratio = fp::div(end_fp, start_fp)?;
 
         // ln(ratio) and exponent = ln(ratio) * t
@@ -309,22 +313,28 @@ impl EmergencyUnstakeExecutor {
         current_balance: i128,
         lock_start_ts: u64,
         unlock_ts: u64,
-    ) -> EmergencyUnstakeRecord {
+    ) -> Result<EmergencyUnstakeRecord, crate::Error> {
         let now = env.ledger().timestamp();
 
         // --- load config --------------------------------------------------
-        let config: EmergencyUnstakeConfig = env
+        let config: EmergencyUnstakeConfig = match env
             .storage()
             .persistent()
             .get(&EmergencyDataKey::Config)
-            .expect("EmergencyUnstakeConfig not initialized");
+        {
+            Some(c) => c,
+            None => return Err(crate::Error::EmergencyConfigNotInitialized),
+        };
 
-        assert!(config.enabled, "EmergencyUnstakeDisabled");
-        assert!(amount > 0, "InvalidEmergencyUnstakeAmount");
-        assert!(
-            amount <= current_balance,
-            "InsufficientBalanceForEmergencyUnstake"
-        );
+        if !config.enabled {
+            return Err(crate::Error::EmergencyUnstakeDisabled);
+        }
+        if amount <= 0 {
+            return Err(crate::Error::InvalidEmergencyUnstakeAmount);
+        }
+        if amount > current_balance {
+            return Err(crate::Error::InsufficientBalance);
+        }
 
         // --- cooldown check -----------------------------------------------
         let cooldown_end: u64 = env
@@ -332,7 +342,9 @@ impl EmergencyUnstakeExecutor {
             .persistent()
             .get(&EmergencyDataKey::CooldownEnd(staker.clone()))
             .unwrap_or(0);
-        assert!(now >= cooldown_end, "CooldownActive");
+        if now < cooldown_end {
+            return Err(crate::Error::CooldownActive);
+        }
 
         // --- compute penalty ----------------------------------------------
         let total_lock_seconds = unlock_ts.saturating_sub(lock_start_ts);
@@ -343,7 +355,7 @@ impl EmergencyUnstakeExecutor {
             elapsed,
             total_lock_seconds,
         )
-        .expect("PenaltyCalculationFailed");
+        .map_err(|_| crate::Error::InvalidEmergencyUnstakeAmount)?;
 
         let (penalty_amount, amount_returned) =
             PenaltyCalculator::apply_penalty(amount, penalty_bps)
@@ -403,7 +415,7 @@ impl EmergencyUnstakeExecutor {
             record.clone(),
         );
 
-        record
+        Ok(record)
     }
 }
 
@@ -486,7 +498,7 @@ impl EmergencyUnstakeQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixed_point::SCALE;
+    use soroban_sdk::testutils::Address as _;
 
     // Helper: create a minimal config for tests.
     fn test_config(
@@ -494,24 +506,17 @@ mod tests {
         end_bps: i128,
         decay: PenaltyDecayFunction,
     ) -> EmergencyUnstakeConfig {
-        // Treasury address is irrelevant for pure math tests; use a dummy.
-        // We cannot construct soroban Address outside an Env, so we use a
-        // placeholder approach by having a wrapper test in lib-level tests.
-        // Here we just verify the math.
+        // Treasury address is irrelevant for pure math tests; a valid
+        // placeholder is generated from a dummy Env. Note: `Address` cannot be
+        // zero-initialized in this soroban-sdk version, so `core::mem::zeroed()`
+        // (the previous hack) panics at first use.
+        let env = Env::default();
         EmergencyUnstakeConfig {
             penalty_start_bps: start_bps,
             penalty_end_bps: end_bps,
             decay_function: decay,
             cooldown_seconds: 86_400,
-            // SAFETY: We cannot build Address without Env here; the fields
-            // below are not exercised in unit tests that only call the pure
-            // PenaltyCalculator functions.
-            treasury: unsafe {
-                // This is a no-std hack — these unit tests only exercise
-                // PenaltyCalculator which doesn't dereference `treasury`.
-                // Integration-level tests (with Env) construct Address properly.
-                core::mem::zeroed()
-            },
+            treasury: Address::generate(&env),
             enabled: true,
         }
     }
