@@ -1611,3 +1611,122 @@ fn find_badge_reward(defs: &soroban_sdk::Vec<BadgeDefinition>, badge_id: &Symbol
     }
     0
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Scoring Tests ---
+
+    #[test]
+    fn test_score_components_trade() {
+        assert_eq!(compute_trade_score(0), 0);
+        assert_eq!(compute_trade_score(5), 10);
+        assert_eq!(compute_trade_score(15), TRADE_SCORE_MAX);
+    }
+
+    #[test]
+    fn test_score_components_roi() {
+        assert_eq!(compute_roi_score(0), 0);
+        assert_eq!(compute_roi_score(-500), 0);
+        assert_eq!(compute_roi_score(5_000), 15);
+        assert_eq!(compute_roi_score(10_000), ROI_SCORE_MAX);
+        assert_eq!(compute_roi_score(15_000), ROI_SCORE_MAX);
+    }
+
+    #[test]
+    fn test_score_components_streak() {
+        assert_eq!(compute_streak_score(0), 0);
+        assert_eq!(compute_streak_score(3), 9);
+        assert_eq!(compute_streak_score(5), STREAK_SCORE_MAX);
+        assert_eq!(compute_streak_score(10), STREAK_SCORE_MAX);
+    }
+
+    #[test]
+    fn test_score_components_learn() {
+        assert_eq!(compute_learn_score(0, 5), 0);
+        assert_eq!(compute_learn_score(5, 5), LEARN_SCORE_MAX);
+        assert_eq!(compute_learn_score(3, 5), 9);
+    }
+
+    #[test]
+    fn test_score_components_community() {
+        assert_eq!(compute_community_score(0), 0);
+        assert_eq!(compute_community_score(5), COMMUNITY_SCORE_MAX);
+        assert_eq!(compute_community_score(10), COMMUNITY_SCORE_MAX);
+    }
+
+    #[test]
+    fn test_tier_progression() {
+        assert_eq!(score_to_tier(0), ProgressionTier::Bronze);
+        assert_eq!(score_to_tier(24), ProgressionTier::Bronze);
+        assert_eq!(score_to_tier(25), ProgressionTier::Silver);
+        assert_eq!(score_to_tier(49), ProgressionTier::Silver);
+        assert_eq!(score_to_tier(50), ProgressionTier::Gold);
+        assert_eq!(score_to_tier(74), ProgressionTier::Gold);
+        assert_eq!(score_to_tier(75), ProgressionTier::Platinum);
+        assert_eq!(score_to_tier(100), ProgressionTier::Platinum);
+    }
+
+    #[test]
+    fn test_tier_rewards() {
+        assert_eq!(tier_reward(&ProgressionTier::Bronze), REWARD_BRONZE);
+        assert_eq!(tier_reward(&ProgressionTier::Silver), REWARD_SILVER);
+        assert_eq!(tier_reward(&ProgressionTier::Gold), REWARD_GOLD);
+        assert_eq!(tier_reward(&ProgressionTier::Platinum), REWARD_PLATINUM);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(MAX_LEADERBOARD_RETURN, 100);
+        assert_eq!(TRADE_SCORE_MAX, 30);
+        assert_eq!(ROI_SCORE_MAX, 30);
+        assert_eq!(STREAK_SCORE_MAX, 15);
+        assert_eq!(LEARN_SCORE_MAX, 15);
+        assert_eq!(COMMUNITY_SCORE_MAX, 10);
+        assert_eq!(TIER_SILVER, 25);
+        assert_eq!(TIER_GOLD, 50);
+        assert_eq!(TIER_PLATINUM, 75);
+    }
+
+    #[test]
+    fn test_error_codes() {
+        assert_eq!(Error::AlreadyInitialized as u32, 1);
+        assert_eq!(Error::NotInitialized as u32, 2);
+        assert_eq!(Error::UserAlreadyRegistered as u32, 3);
+        assert_eq!(Error::UserNotFound as u32, 4);
+        assert_eq!(Error::BadgeAlreadyEarned as u32, 5);
+        assert_eq!(Error::BadgeNotFound as u32, 6);
+        assert_eq!(Error::ChallengeNotFound as u32, 7);
+        assert_eq!(Error::ChallengeAlreadyEnded as u32, 8);
+        assert_eq!(Error::ChallengeNotStarted as u32, 9);
+        assert_eq!(Error::ChallengeAlreadyJoined as u32, 10);
+        assert_eq!(Error::InvalidChallengeParams as u32, 11);
+        assert_eq!(Error::InsufficientRewardPool as u32, 12);
+        assert_eq!(Error::ArithmeticOverflow as u32, 13);
+        assert_eq!(Error::AdminRequired as u32, 14);
+        assert_eq!(Error::BadgeDefinitionNotFound as u32, 15);
+    }
+
+    #[test]
+    fn test_find_badge_reward() {
+        // Verify find_badge_reward helper works
+        let env = Env::default();
+        let defs = create_default_badge_defs(&env);
+        assert!(find_badge_reward(&defs, &symbol_short!("1ST_TRD")) > 0);
+        assert_eq!(find_badge_reward(&defs, &symbol_short!("NOPE")), 0);
+    }
+
+    #[test]
+    fn test_progression_tier_ordering() {
+        // Verify PartialOrd works correctly for tiers
+        assert!(ProgressionTier::Bronze < ProgressionTier::Silver);
+        assert!(ProgressionTier::Silver < ProgressionTier::Gold);
+        assert!(ProgressionTier::Gold < ProgressionTier::Platinum);
+        assert!(ProgressionTier::Platinum > ProgressionTier::Bronze);
+    }
+}
