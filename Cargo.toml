@@ -1,9 +1,11 @@
 [workspace]
 members = [
+    "contracts/audit",
     "contracts/rebalancing",
     "contracts/events",
     "contracts/staking",
     "contracts/fee",
+    "contracts/versioning",
 ]
 resolver = "2"
 
@@ -16,6 +18,9 @@ license = "Apache-2.0"
 [workspace.dependencies]
 soroban-sdk = "=21.5.0"
 soroban-contract = "=21.5.0"
+
+[patch.crates-io]
+ethnum = { path = "../ethnum-rs-patched" }
 
 [profile.release]
 opt-level = "z"
