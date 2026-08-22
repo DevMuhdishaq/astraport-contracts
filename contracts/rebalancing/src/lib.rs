@@ -8,6 +8,9 @@ use astraport_audit::logger::AuditLogger;
 use astraport_audit::records::{permissions, AuditEventType, StateSnapshot};
 
 pub mod rbac;
+pub mod records;
+pub mod drift_engine;
+pub mod multi_asset_rebalancer;
 use crate::rbac::{
     assign_role, check_permission, check_permission_detailed, describe_permissions,
     extend_role_expiry, get_access_log, get_raw_assignment, get_role_assignment, has_permission,
@@ -44,6 +47,8 @@ pub enum RebalancingError {
     CannotRevokeOwner = 9,
     /// RBAC: role assignment has expired.
     RoleExpired = 10,
+    /// The drift threshold is greater than 100%.
+    InvalidDriftThreshold = 11,
 }
 
 #[contracttype]
@@ -535,6 +540,9 @@ impl RebalancingContract {
             rbac::CAN_MODIFY_ALLOCATIONS,
             &Symbol::new(&env, "set_drift"),
         )?;
+        if threshold_bps > 10_000 {
+            return Err(RebalancingError::InvalidDriftThreshold);
+        }
         let key = DataKey::DriftThreshold(portfolio_id);
         env.storage().persistent().set(&key, &threshold_bps);
         Ok(())
@@ -675,10 +683,17 @@ impl RebalancingContract {
             rbac::CAN_EXECUTE_REBALANCE,
             &Symbol::new(&env, "exec_rebal"),
         )?;
+        let result = Self::calculate_rebalance(&env, &portfolio_id)?;
         let rebalancer_id =
             env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
         let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
-        client.rebalance(&portfolio_id, &strategy);
+        client.rebalance(&portfolio_id, &strategy, &result.adjustments);
+        Self::record_execution(
+            &env,
+            &portfolio_id,
+            symbol_short!("done"),
+            symbol_short!("manual"),
+        );
         Ok(())
     }
 
@@ -687,10 +702,15 @@ impl RebalancingContract {
         portfolio_id: Symbol,
         strategy: multi_asset_rebalancer::ExecutionStrategy,
     ) -> Result<multi_asset_rebalancer::SimulationResult, RebalancingError> {
+        let result = Self::calculate_rebalance(&env, &portfolio_id)?;
         let rebalancer_id =
             env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
         let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
-        Ok(client.simulate_rebalance(&portfolio_id, &strategy))
+        Ok(client.simulate_rebalance(
+            &portfolio_id,
+            &strategy,
+            &result.adjustments,
+        ))
     }
 
     // -------------------------------------------------------------------
@@ -1053,6 +1073,278 @@ impl RebalancingContract {
                 direction,
             });
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Core Rebalancing Engine public endpoints
+    // ------------------------------------------------------------------
+
+    /// Calculate per-asset drift for a portfolio with ±0.01% accuracy.
+    ///
+    /// Returns a `DriftReport` containing per-asset drift data and a
+    /// portfolio-wide summary. This is the primary drift detection entry
+    /// point.
+    pub fn calculate_portfolio_drift(
+        env: Env,
+        portfolio_id: Symbol,
+    ) -> Result<records::DriftReport, RebalancingError> {
+        let target: TargetAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocation(portfolio_id.clone()))
+            .ok_or(RebalancingError::TargetAllocationNotFound)?;
+        let current: CurrentHoldings = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentHoldings(portfolio_id.clone()))
+            .ok_or(RebalancingError::CurrentHoldingsNotFound)?;
+        let threshold = Self::get_drift_threshold_bps(env.clone(), portfolio_id.clone());
+
+        Ok(drift_engine::DriftEngine::calculate_portfolio_drift(
+            &env,
+            &portfolio_id,
+            &target,
+            &current,
+            threshold,
+        ))
+    }
+
+    /// Detect whether rebalancing is needed for a portfolio.
+    ///
+    /// Returns `(needs_rebalance, out_of_threshold_count)`.
+    pub fn detect_rebalancing_need(
+        env: Env,
+        portfolio_id: Symbol,
+    ) -> Result<(bool, u32), RebalancingError> {
+        let target: TargetAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocation(portfolio_id.clone()))
+            .ok_or(RebalancingError::TargetAllocationNotFound)?;
+        let current: CurrentHoldings = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentHoldings(portfolio_id.clone()))
+            .ok_or(RebalancingError::CurrentHoldingsNotFound)?;
+        let threshold = Self::get_drift_threshold_bps(env.clone(), portfolio_id.clone());
+
+        Ok(drift_engine::DriftEngine::detect_rebalancing_need(
+            &env,
+            &portfolio_id,
+            &target,
+            &current,
+            threshold,
+        ))
+    }
+
+    /// Calculate specific trade orders to restore target allocation.
+    ///
+    /// Returns a `RebalancePlan` with concrete trade amounts, estimated
+    /// fees, and slippage. The plan can be executed atomically or
+    /// simulated first.
+    pub fn calculate_rebalance_trades(
+        env: Env,
+        portfolio_id: Symbol,
+        total_portfolio_value: i128,
+    ) -> Result<records::RebalancePlan, RebalancingError> {
+        let target: TargetAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocation(portfolio_id.clone()))
+            .ok_or(RebalancingError::TargetAllocationNotFound)?;
+        let current: CurrentHoldings = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentHoldings(portfolio_id.clone()))
+            .ok_or(RebalancingError::CurrentHoldingsNotFound)?;
+        let threshold = Self::get_drift_threshold_bps(env.clone(), portfolio_id.clone());
+        let constraints = records::TradeConstraints::default();
+
+        Ok(drift_engine::DriftEngine::calculate_rebalance_trades(
+            &env,
+            &portfolio_id,
+            &target,
+            &current,
+            threshold,
+            &constraints,
+            total_portfolio_value,
+        ))
+    }
+
+    /// Simulate a rebalance without modifying any state.
+    ///
+    /// Returns a `SimulationPlanResult` with before/after drift reports,
+    /// the computed trade plan, and whether the plan fully resolves drift.
+    pub fn simulate_rebalance_full(
+        env: Env,
+        portfolio_id: Symbol,
+        total_portfolio_value: i128,
+    ) -> Result<records::SimulationPlanResult, RebalancingError> {
+        let target: TargetAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocation(portfolio_id.clone()))
+            .ok_or(RebalancingError::TargetAllocationNotFound)?;
+        let current: CurrentHoldings = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentHoldings(portfolio_id.clone()))
+            .ok_or(RebalancingError::CurrentHoldingsNotFound)?;
+        let threshold = Self::get_drift_threshold_bps(env.clone(), portfolio_id.clone());
+        let constraints = records::TradeConstraints::default();
+
+        Ok(drift_engine::DriftEngine::simulate_rebalance_full(
+            &env,
+            &portfolio_id,
+            &target,
+            &current,
+            threshold,
+            &constraints,
+            total_portfolio_value,
+        ))
+    }
+
+    /// Validate rebalance inputs (target allocation, current holdings,
+    /// drift threshold) before computing a plan.
+    pub fn validate_rebalance_inputs(
+        env: Env,
+        target: TargetAllocation,
+        current: CurrentHoldings,
+        threshold_bps: u32,
+    ) -> records::RebalanceValidation {
+        drift_engine::DriftEngine::validate_rebalance_inputs(
+            &env,
+            &target,
+            &current,
+            threshold_bps,
+        )
+    }
+
+    /// Execute an atomic rebalance using the core engine.
+    ///
+    /// This computes the rebalance plan, validates it, and records the
+    /// operation in history. The operation is all-or-nothing: if any
+    /// trade would fail, the entire rebalance is aborted.
+    pub fn execute_atomic_rebalance(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        total_portfolio_value: i128,
+    ) -> Result<records::RebalanceRecord, RebalancingError> {
+        Self::require_auth_or_rbac(
+            &env,
+            &owner,
+            &portfolio_id,
+            rbac::CAN_REBALANCE,
+            &Symbol::new(&env, "atomic_rebal"),
+        )?;
+
+        let target: TargetAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocation(portfolio_id.clone()))
+            .ok_or(RebalancingError::TargetAllocationNotFound)?;
+        let current: CurrentHoldings = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentHoldings(portfolio_id.clone()))
+            .ok_or(RebalancingError::CurrentHoldingsNotFound)?;
+        let threshold = Self::get_drift_threshold_bps(env.clone(), portfolio_id.clone());
+        let constraints = records::TradeConstraints::default();
+
+        // Compute drift before.
+        let drift_before = drift_engine::DriftEngine::calculate_portfolio_drift(
+            &env,
+            &portfolio_id,
+            &target,
+            &current,
+            threshold,
+        );
+
+        // Calculate the plan.
+        let plan = drift_engine::DriftEngine::calculate_rebalance_trades(
+            &env,
+            &portfolio_id,
+            &target,
+            &current,
+            threshold,
+            &constraints,
+            total_portfolio_value,
+        );
+
+        // Simulate post-rebalance drift.
+        let sim_result = drift_engine::DriftEngine::simulate_rebalance_full(
+            &env,
+            &portfolio_id,
+            &target,
+            &current,
+            threshold,
+            &constraints,
+            total_portfolio_value,
+        );
+
+        // A plan is executable only when every detected drift can be resolved.
+        // No state is changed until this check succeeds.
+        let atomic_success = plan.warnings.is_empty() && sim_result.fully_rebalanced;
+
+        // Record the execution.
+        let record = drift_engine::DriftEngine::create_rebalance_record(
+            &env,
+            &portfolio_id,
+            &drift_before,
+            &sim_result.drift_after,
+            plan.trades.len(),
+            atomic_success,
+            &symbol_short!("manual"),
+            plan.estimated_total_fees,
+        );
+
+        // Append to history.
+        Self::record_execution(
+            &env,
+            &portfolio_id,
+            record.outcome.clone(),
+            symbol_short!("atomic"),
+        );
+
+        if atomic_success {
+            env.storage().persistent().set(
+                &DataKey::CurrentHoldings(portfolio_id.clone()),
+                &target,
+            );
+        }
+
+        // Audit logging.
+        let snapshot_before = env
+            .storage()
+            .persistent()
+            .get::<DataKey, CurrentHoldings>(&DataKey::CurrentHoldings(portfolio_id.clone()));
+        let snapshot_after = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TargetAllocation>(&DataKey::Allocation(portfolio_id.clone()));
+        let mut before_map = Map::new(&env);
+        let mut after_map = Map::new(&env);
+        if let Some(h) = snapshot_before {
+            for (k, v) in h.allocations.iter() {
+                before_map.set(k, v);
+            }
+        }
+        if let Some(a) = snapshot_after {
+            for (k, v) in a.allocations.iter() {
+                after_map.set(k, v);
+            }
+        }
+        Self::log_audit_if_configured(
+            &env,
+            &portfolio_id,
+            record.outcome.clone(),
+            "atomic_rebalance",
+            &before_map,
+            &after_map,
+        );
+
+        Ok(record)
     }
 
     fn record_execution(env: &Env, portfolio_id: &Symbol, outcome: Symbol, details: Symbol) {

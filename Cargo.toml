@@ -6,6 +6,7 @@ members = [
     "contracts/staking",
     "contracts/fee",
     "contracts/gamification",
+    "contracts/valuation",
     "contracts/versioning",
 ]
 resolver = "2"
@@ -20,8 +21,7 @@ license = "Apache-2.0"
 soroban-sdk = "=21.5.0"
 soroban-contract = "=21.5.0"
 
-[patch.crates-io]
-ethnum = { path = "../ethnum-rs-patched" }
+
 
 [profile.release]
 opt-level = "z"
