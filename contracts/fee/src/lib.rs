@@ -197,19 +197,246 @@ pub struct FeeManagementContract;
 
 #[contractimpl]
 impl FeeManagementContract {
+    // -- Initialization & Admin --
+
+    pub fn initialize(env: Env, admin: Address) -> Symbol {
+        put_admin(&env, &admin);
+        symbol_short!("ok")
+    }
+    pub fn get_admin(env: Env) -> Address {
+        get_admin(&env)
+    }
+    pub fn transfer_admin(env: Env, new_admin: Address) -> Symbol {
+        get_admin(&env).require_auth();
+        put_admin(&env, &new_admin);
+        symbol_short!("ok")
+    }
+
+    // -- Fee Structure Management --
+
+    pub fn set_fee_structure(
+        env: Env, fee_id: Symbol, fee_type: FeeType, amount_bps: i128,
+        tiered_entries: soroban_sdk::Vec<TierEntry>, active: bool,
+    ) -> Symbol {
+        get_admin(&env).require_auth();
+        match fee_type {
+            FeeType::Percentage => {
+                if amount_bps < 0 || amount_bps > BPS_DENOM {
+                    soroban_sdk::panic_with_error!(&env, Error::InvalidFeeConfiguration);
+                }
+            }
+            FeeType::Flat => {
+                if amount_bps < 0 {
+                    soroban_sdk::panic_with_error!(&env, Error::InvalidFeeConfiguration);
+                }
+            }
+            FeeType::Tiered => {
+                if tiered_entries.is_empty() {
+                    soroban_sdk::panic_with_error!(&env, Error::InvalidFeeConfiguration);
+                }
+            }
+        }
+        let fs = FeeStructure { fee_id: fee_id.clone(), fee_type, amount_bps, tiered_entries, active };
+        put_fee_structure(&env, &fs);
+        add_fee_id(&env, &fee_id);
+        symbol_short!("ok")
+    }
+
+    pub fn get_fee_structure(env: Env, fee_id: Symbol) -> Option<FeeStructure> {
+        get_fee_structure(&env, &fee_id)
+    }
+    pub fn list_fee_structures(env: Env) -> soroban_sdk::Vec<Symbol> {
+        list_all_fee_ids(&env)
+    }
+    pub fn set_fee_active(env: Env, fee_id: Symbol, active: bool) -> Symbol {
+        get_admin(&env).require_auth();
+        let mut fs = get_fee_structure(&env, &fee_id)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, Error::FeeNotFound));
+        fs.active = active;
+        put_fee_structure(&env, &fs);
+        symbol_short!("ok")
+    }
+
+    // -- Portfolio Fee Assignment --
+
+    pub fn set_portfolio_fee(env: Env, portfolio_id: Symbol, fee_id: Symbol) -> Symbol {
+        get_admin(&env).require_auth();
+        let _ = get_fee_structure(&env, &fee_id)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, Error::FeeNotFound));
+        set_portfolio_fee_id(&env, &portfolio_id, &fee_id);
+        symbol_short!("ok")
+    }
+    pub fn get_portfolio_fee(env: Env, portfolio_id: Symbol) -> Option<Symbol> {
+        get_portfolio_fee_id(&env, &portfolio_id)
+    }
+    pub fn remove_portfolio_fee(env: Env, portfolio_id: Symbol) -> Symbol {
+        get_admin(&env).require_auth();
+        remove_portfolio_fee_id(&env, &portfolio_id);
+        symbol_short!("ok")
+    }
+
+    // -- Fee Calculation --
+
+    pub fn calculate_fee(env: Env, fee_id: Symbol, amount: i128) -> FeeCalculationResult {
+        let fs = get_fee_structure(&env, &fee_id)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, Error::FeeNotFound));
+        if !fs.active { soroban_sdk::panic_with_error!(&env, Error::FeeInactive); }
+        let f = Self::clamp_fee(
+            Self::compute_raw_fee(&env, &fs.fee_type, &fs.amount_bps, &fs.tiered_entries, amount),
+            amount,
+        );
+        FeeCalculationResult { fee_id, gross_amount: amount, discount_bps: 0, fee_amount: f, waived: false }
+    }
+
+    pub fn calculate_portfolio_fee(
+        env: Env, portfolio_id: Symbol, fallback_fee_id: Symbol, amount: i128,
+    ) -> FeeCalculationResult {
+        let fee_id = get_portfolio_fee_id(&env, &portfolio_id).unwrap_or(fallback_fee_id);
+        let fs = get_fee_structure(&env, &fee_id)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, Error::FeeNotFound));
+        if !fs.active { soroban_sdk::panic_with_error!(&env, Error::FeeInactive); }
+        let gf = Self::clamp_fee(
+            Self::compute_raw_fee(&env, &fs.fee_type, &fs.amount_bps, &fs.tiered_entries, amount),
+            amount,
+        );
+        let (db, w) = Self::resolve_waiver_for_portfolio(&env, &portfolio_id);
+        let nf = Self::apply_discount(&env, gf, db, w);
+        FeeCalculationResult { fee_id, gross_amount: amount, discount_bps: db, fee_amount: nf, waived: w }
+    }
+
+    // -- Fee Collection & Distribution --
+
+    pub fn collect_fee(
+        env: Env, caller: Address, fee_id: Symbol, portfolio_id: Symbol, base_amount: i128,
+    ) -> i128 {
+        caller.require_auth();
+        let fs = get_fee_structure(&env, &fee_id)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, Error::FeeNotFound));
+        if !fs.active { soroban_sdk::panic_with_error!(&env, Error::FeeInactive); }
+        let gf = Self::clamp_fee(
+            Self::compute_raw_fee(&env, &fs.fee_type, &fs.amount_bps, &fs.tiered_entries, base_amount),
+            base_amount,
+        );
+        let (db, w) = Self::resolve_waiver_for_collect(&env, &caller, &portfolio_id);
+        let nf = Self::apply_discount(&env, gf, db, w);
+        append_fee_record(&env, &FeeRecord {
+            fee_id, portfolio_id, amount: base_amount, calculated_fee: nf,
+            timestamp: env.ledger().timestamp(), beneficiary: caller,
+        });
+        add_to_total_collected(&env, nf);
+        Self::distribute_revenue(&env, nf);
+        nf
+    }
+
+    pub fn collect_yield_fee(env: Env, caller: Address, portfolio_id: Symbol, y: i128) -> i128 {
+        Self::collect_fee(env, caller, symbol_short!("YIELD"), portfolio_id, y)
+    }
+    pub fn collect_management_fee(env: Env, caller: Address, portfolio_id: Symbol, aum: i128) -> i128 {
+        Self::collect_fee(env, caller, symbol_short!("MGMT"), portfolio_id, aum)
+    }
+    pub fn collect_rebalance_fee(env: Env, caller: Address, portfolio_id: Symbol, t: i128) -> i128 {
+        Self::collect_fee(env, caller, symbol_short!("REBAL"), portfolio_id, t)
+    }
+
+    // -- Fee Waivers & Discounts --
+
+    pub fn set_fee_waiver(
+        env: Env, address: Option<Address>, portfolio_id: Option<Symbol>,
+        discount_bps: i128, waived: bool,
+    ) -> Symbol {
+        get_admin(&env).require_auth();
+        if discount_bps < 0 || discount_bps > BPS_DENOM {
+            soroban_sdk::panic_with_error!(&env, Error::InvalidFeeConfiguration);
+        }
+        let w = FeeWaiver { address, portfolio_id, discount_bps, waived };
+        let mut waivers = get_fee_waivers(&env);
+        let mut found = false;
+        let mut idx: u32 = 0;
+        while idx < waivers.len() {
+            let e = waivers.get(idx).unwrap();
+            if Self::waiver_matches(&e, &w) { waivers.set(idx, w.clone()); found = true; break; }
+            idx += 1;
+        }
+        if !found { waivers.push_back(w); }
+        put_fee_waivers(&env, &waivers);
+        symbol_short!("ok")
+    }
+
+    pub fn remove_fee_waiver(env: Env, address: Option<Address>, portfolio_id: Option<Symbol>) -> Symbol {
+        get_admin(&env).require_auth();
+        let waivers = get_fee_waivers(&env);
+        let mut nw = soroban_sdk::Vec::new(&env);
+        for w in waivers.iter() {
+            let t = FeeWaiver { address: address.clone(), portfolio_id: portfolio_id.clone(), discount_bps: 0, waived: false };
+            if !Self::waiver_matches(&w, &t) { nw.push_back(w); }
+        }
+        put_fee_waivers(&env, &nw);
+        symbol_short!("ok")
+    }
+    pub fn list_fee_waivers(env: Env) -> soroban_sdk::Vec<FeeWaiver> {
+        get_fee_waivers(&env)
+    }
+
+    // -- Revenue Distribution --
+
+    pub fn set_revenue_recipients(env: Env, recipients: soroban_sdk::Vec<RevenueRecipient>) -> Symbol {
+        get_admin(&env).require_auth();
+        if recipients.len() > MAX_RECIPIENTS {
+            soroban_sdk::panic_with_error!(&env, Error::TooManyRecipients);
+        }
+        put_revenue_recipients(&env, &recipients);
+        symbol_short!("ok")
+    }
+    pub fn list_revenue_recipients(env: Env) -> soroban_sdk::Vec<RevenueRecipient> {
+        get_revenue_recipients(&env)
+    }
+    pub fn distribute_revenue_amount(env: Env, amount: i128) -> soroban_sdk::Vec<(Address, i128)> {
+        Self::distribute_revenue(&env, amount)
+    }
+
+    // -- Reporting --
+
+    pub fn get_total_collected(env: Env) -> i128 {
+        env.storage().instance().get(&TOT_COLL).unwrap_or(0)
+    }
+    pub fn get_fee_history(env: Env, max: u32) -> soroban_sdk::Vec<FeeRecord> {
+        let h = get_fee_history(&env);
+        if max == 0 || h.len() <= max { h } else { h.slice(h.len() - max..) }
+    }
+    pub fn get_fee_history_count(env: Env) -> u32 {
+        get_fee_history(&env).len()
+    }
+
+    pub fn estimate_fee(
+        env: Env, fee_id: Symbol, portfolio_id: Option<Symbol>, amount: i128,
+    ) -> FeeCalculationResult {
+        let eid = match &portfolio_id {
+            Some(p) => get_portfolio_fee_id(&env, p).unwrap_or(fee_id),
+            None => fee_id,
+        };
+        let fs = get_fee_structure(&env, &eid)
+            .unwrap_or_else(|| soroban_sdk::panic_with_error!(&env, Error::FeeNotFound));
+        if !fs.active { soroban_sdk::panic_with_error!(&env, Error::FeeInactive); }
+        let gf = Self::clamp_fee(
+            Self::compute_raw_fee(&env, &fs.fee_type, &fs.amount_bps, &fs.tiered_entries, amount),
+            amount,
+        );
+        let (db, w) = match &portfolio_id {
+            Some(p) => Self::resolve_waiver_for_portfolio(&env, p),
+            None => (0, false),
+        };
+        let nf = Self::apply_discount(&env, gf, db, w);
+        FeeCalculationResult { fee_id: eid, gross_amount: amount, discount_bps: db, fee_amount: nf, waived: w }
+    }
+
     // -- Internal Helpers --
 
-    pub(crate) fn compute_raw_fee(
-        env: &Env,
-        ft: &FeeType,
-        ab: &i128,
-        te: &soroban_sdk::Vec<TierEntry>,
-        amt: i128,
+    fn compute_raw_fee(
+        env: &Env, ft: &FeeType, ab: &i128, te: &soroban_sdk::Vec<TierEntry>, amt: i128,
     ) -> i128 {
         match ft {
             FeeType::Flat => *ab,
-            FeeType::Percentage => amt
-                .checked_mul(*ab)
+            FeeType::Percentage => amt.checked_mul(*ab)
                 .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, Error::ArithmeticOverflow))
                 / BPS_DENOM,
             FeeType::Tiered => Self::calculate_tiered_fee(env, te, amt),
@@ -222,13 +449,9 @@ impl FeeManagementContract {
     }
 
     fn apply_discount(env: &Env, gf: i128, db: i128, waived: bool) -> i128 {
-        if waived {
-            0
-        } else if db <= 0 {
-            gf
-        } else {
-            let n = gf
-                .checked_mul(BPS_DENOM - db)
+        if waived { 0 } else if db <= 0 { gf }
+        else {
+            let n = gf.checked_mul(BPS_DENOM - db)
                 .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, Error::ArithmeticOverflow))
                 / BPS_DENOM;
             if n < 0 { 0 } else { n }
@@ -239,22 +462,14 @@ impl FeeManagementContract {
         let mut abps: i128 = 0;
         let mut found = false;
         let len = tiers.len();
-        if len == 0 {
-            return 0;
-        }
+        if len == 0 { return 0; }
         let mut i = len;
         while i > 0 {
             i -= 1;
             let t = tiers.get(i).unwrap();
-            if amt >= t.threshold {
-                abps = t.fee_bps;
-                found = true;
-                break;
-            }
+            if amt >= t.threshold { abps = t.fee_bps; found = true; break; }
         }
-        if !found {
-            return 0;
-        }
+        if !found { return 0; }
         amt.checked_mul(abps)
             .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, Error::ArithmeticOverflow))
             / BPS_DENOM
@@ -276,29 +491,19 @@ impl FeeManagementContract {
     fn resolve_waiver_for_portfolio(env: &Env, pid: &Symbol) -> (i128, bool) {
         for w in get_fee_waivers(env).iter() {
             if let Some(ref wp) = w.portfolio_id {
-                if wp == pid {
-                    return (w.discount_bps, w.waived);
-                }
+                if wp == pid { return (w.discount_bps, w.waived); }
             }
         }
         (0, false)
     }
 
-    fn resolve_waiver_for_collect(
-        env: &Env,
-        addr: &Address,
-        pid: &Symbol,
-    ) -> (i128, bool) {
+    fn resolve_waiver_for_collect(env: &Env, addr: &Address, pid: &Symbol) -> (i128, bool) {
         for w in get_fee_waivers(env).iter() {
             if let Some(ref wa) = w.address {
-                if wa == addr {
-                    return (w.discount_bps, w.waived);
-                }
+                if wa == addr { return (w.discount_bps, w.waived); }
             }
             if let Some(ref wp) = w.portfolio_id {
-                if wp == pid {
-                    return (w.discount_bps, w.waived);
-                }
+                if wp == pid { return (w.discount_bps, w.waived); }
             }
         }
         (0, false)
@@ -307,23 +512,14 @@ impl FeeManagementContract {
     fn distribute_revenue(env: &Env, amount: i128) -> soroban_sdk::Vec<(Address, i128)> {
         let recips = get_revenue_recipients(env);
         let mut r = soroban_sdk::Vec::new(env);
-        if recips.is_empty() || amount <= 0 {
-            return r;
-        }
+        if recips.is_empty() || amount <= 0 { return r; }
         let mut ts: i128 = 0;
-        for rp in recips.iter() {
-            ts += rp.share_numerator as i128;
-        }
-        if ts == 0 {
-            return r;
-        }
+        for rp in recips.iter() { ts += rp.share_numerator as i128; }
+        if ts == 0 { return r; }
         let mut dist: i128 = 0;
         for rp in recips.iter() {
-            let s = (rp.share_numerator as i128)
-                .checked_mul(amount)
-                .unwrap_or_else(|| {
-                    soroban_sdk::panic_with_error!(env, Error::ArithmeticOverflow)
-                })
+            let s = (rp.share_numerator as i128).checked_mul(amount)
+                .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, Error::ArithmeticOverflow))
                 / ts;
             dist += s;
             r.push_back((rp.address, s));
