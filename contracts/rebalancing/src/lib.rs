@@ -7,6 +7,7 @@ use soroban_sdk::{
 use astraport_audit::logger::AuditLogger;
 use astraport_audit::records::{permissions, AuditEventType, StateSnapshot};
 
+pub mod alerts;
 pub mod rbac;
 pub mod records;
 pub mod drift_engine;
@@ -47,6 +48,12 @@ pub enum RebalancingError {
     CannotRevokeOwner = 9,
     /// RBAC: role assignment has expired.
     RoleExpired = 10,
+    /// Alerts: no alert configuration exists for this portfolio.
+    AlertConfigNotFound = 11,
+    /// Alerts: the per-portfolio threshold limit has been reached.
+    AlertThresholdLimitReached = 12,
+    /// Alerts: the referenced alert/threshold index is out of range.
+    AlertIndexOutOfRange = 13,
     /// The drift threshold is greater than 100%.
     InvalidDriftThreshold = 11,
 }
@@ -944,6 +951,197 @@ impl RebalancingContract {
         env.storage().persistent().set(&DataKey::AuditSink, &sink);
         Ok(symbol_short!("ok"))
     }
+
+    // -------------------------------------------------------------------
+    // Alert & monitoring endpoints
+    // -------------------------------------------------------------------
+
+    /// Create or fully replace the alert configuration for a portfolio.
+    ///
+    /// Requires owner or `CAN_CONFIGURE`. The stored config's `portfolio_id`
+    /// is forced to the `portfolio_id` argument regardless of the value carried
+    /// inside `config`.
+    pub fn set_alert_config(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        config: alerts::AlertConfig,
+    ) -> Result<alerts::AlertConfig, RebalancingError> {
+        Self::require_auth_or_rbac(
+            &env,
+            &owner,
+            &portfolio_id,
+            rbac::CAN_CONFIGURE,
+            &Symbol::new(&env, "set_alert_cfg"),
+        )?;
+        let config = alerts::AlertConfig {
+            portfolio_id: portfolio_id.clone(),
+            thresholds: config.thresholds,
+            alerts_enabled: config.alerts_enabled,
+        };
+        let monitor = alerts::AlertMonitor::new(&env);
+        Ok(monitor.set_config(config))
+    }
+
+    /// Append a threshold to a portfolio's alert configuration.
+    ///
+    /// Requires owner or `CAN_CONFIGURE`.
+    pub fn add_alert_threshold(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        threshold: alerts::AlertThreshold,
+    ) -> Result<alerts::AlertConfig, RebalancingError> {
+        Self::require_auth_or_rbac(
+            &env,
+            &owner,
+            &portfolio_id,
+            rbac::CAN_CONFIGURE,
+            &Symbol::new(&env, "add_thresh"),
+        )?;
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.add_threshold(&portfolio_id, threshold)
+    }
+
+    /// Remove the threshold at `index` from a portfolio's alert configuration.
+    ///
+    /// Requires owner or `CAN_CONFIGURE`.
+    pub fn remove_alert_threshold(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        index: u32,
+    ) -> Result<alerts::AlertConfig, RebalancingError> {
+        Self::require_auth_or_rbac(
+            &env,
+            &owner,
+            &portfolio_id,
+            rbac::CAN_CONFIGURE,
+            &Symbol::new(&env, "rm_thresh"),
+        )?;
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.remove_threshold(&portfolio_id, index)
+    }
+
+    /// Enable or disable all alerts for a portfolio (master switch).
+    ///
+    /// Requires owner or `CAN_CONFIGURE`.
+    pub fn set_alerts_enabled(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        enabled: bool,
+    ) -> Result<alerts::AlertConfig, RebalancingError> {
+        Self::require_auth_or_rbac(
+            &env,
+            &owner,
+            &portfolio_id,
+            rbac::CAN_CONFIGURE,
+            &Symbol::new(&env, "set_al_en"),
+        )?;
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.set_alerts_enabled(&portfolio_id, enabled)
+    }
+
+    /// Acknowledge the alert at `index` in a portfolio's history.
+    ///
+    /// Requires owner or `CAN_CONFIGURE`.
+    pub fn acknowledge_alert(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        index: u32,
+    ) -> Result<Symbol, RebalancingError> {
+        Self::require_auth_or_rbac(
+            &env,
+            &owner,
+            &portfolio_id,
+            rbac::CAN_CONFIGURE,
+            &Symbol::new(&env, "ack_alert"),
+        )?;
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.acknowledge(&portfolio_id, index)?;
+        Ok(symbol_short!("ok"))
+    }
+
+    /// Read the alert configuration for a portfolio, if any. Public read.
+    pub fn get_alert_config(env: Env, portfolio_id: Symbol) -> Option<alerts::AlertConfig> {
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.get_config(&portfolio_id)
+    }
+
+    /// Read the full alert history for a portfolio (oldest first). Public read.
+    pub fn get_alert_history(env: Env, portfolio_id: Symbol) -> Vec<alerts::AlertHistoryEntry> {
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.history(&portfolio_id)
+    }
+
+    /// Read only the unacknowledged alerts for a portfolio. Public read.
+    pub fn get_pending_alerts(env: Env, portfolio_id: Symbol) -> Vec<alerts::AlertHistoryEntry> {
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.pending_alerts(&portfolio_id)
+    }
+
+    /// Evaluate drift-based alerts for a portfolio against its stored target
+    /// allocation and current holdings.
+    ///
+    /// Permissionless (mirrors the scheduled-rebalance checks): recording a
+    /// factual breach requires no authorization. Returns the number of alerts
+    /// that fired.
+    pub fn check_portfolio_alerts(env: Env, portfolio_id: Symbol) -> u32 {
+        let observations = Self::build_drift_observations(&env, &portfolio_id);
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.check(&portfolio_id, observations)
+    }
+
+    /// Evaluate alerts for a portfolio against its stored drift metrics plus
+    /// caller-supplied observations (e.g. balance, yield, custom metrics).
+    ///
+    /// Drift observations are computed from storage; the `extra` observations
+    /// are appended before evaluation. Permissionless. Returns the number of
+    /// alerts that fired.
+    pub fn check_portfolio_alerts_with(
+        env: Env,
+        portfolio_id: Symbol,
+        extra: Vec<alerts::MetricObservation>,
+    ) -> u32 {
+        let mut observations = Self::build_drift_observations(&env, &portfolio_id);
+        for i in 0..extra.len() {
+            observations.push_back(extra.get(i).unwrap());
+        }
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.check(&portfolio_id, observations)
+    }
+
+    /// Update the threshold at `index` in a portfolio's alert configuration.
+    ///
+    /// Replaces the threshold in-place without changing the order of other
+    /// thresholds. This does not disrupt ongoing monitoring.
+    ///
+    /// Requires owner or `CAN_CONFIGURE`.
+    pub fn update_alert_threshold(
+        env: Env,
+        owner: Address,
+        portfolio_id: Symbol,
+        index: u32,
+        threshold: alerts::AlertThreshold,
+    ) -> Result<alerts::AlertConfig, RebalancingError> {
+        Self::require_auth_or_rbac(
+            &env,
+            &owner,
+            &portfolio_id,
+            rbac::CAN_CONFIGURE,
+            &Symbol::new(&env, "upd_thresh"),
+        )?;
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.update_threshold(&portfolio_id, index, threshold)
+    }
+
+    /// Read the aggregated alert statistics for a portfolio. Public read.
+    pub fn get_alert_statistics(env: Env, portfolio_id: Symbol) -> Option<alerts::AlertStatistics> {
+        let monitor = alerts::AlertMonitor::new(&env);
+        monitor.get_statistics(&portfolio_id)
+    }
 }
 
 impl RebalancingContract {
@@ -997,6 +1195,76 @@ impl RebalancingContract {
                 detail_str,
             );
         }
+    }
+
+    /// Build drift [`alerts::MetricObservation`]s from a portfolio's stored
+    /// target allocation and current holdings.
+    ///
+    /// Produces one [`alerts::MetricType::AssetDrift`] observation per asset in
+    /// `target ∪ current` carrying the **absolute** drift magnitude in bps, plus
+    /// a single [`alerts::MetricType::PortfolioDrift`] observation holding the
+    /// maximum absolute drift across all assets. Returns an empty vector when
+    /// either the target allocation or current holdings are unset. The drift math
+    /// mirrors [`Self::add_adjustment_if_needed`].
+    fn build_drift_observations(
+        env: &Env,
+        portfolio_id: &Symbol,
+    ) -> Vec<alerts::MetricObservation> {
+        let mut observations = Vec::new(env);
+        let target: TargetAllocation = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allocation(portfolio_id.clone()))
+        {
+            Some(t) => t,
+            None => return observations,
+        };
+        let current: CurrentHoldings = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentHoldings(portfolio_id.clone()))
+        {
+            Some(c) => c,
+            None => return observations,
+        };
+
+        let mut max_drift: i128 = 0;
+
+        // Assets present in the target allocation.
+        for (asset, target_weight) in target.allocations.iter() {
+            let current_weight = current.allocations.get(asset.clone()).unwrap_or(0);
+            let drift = (current_weight as i32 - target_weight as i32).unsigned_abs() as i128;
+            if drift > max_drift {
+                max_drift = drift;
+            }
+            observations.push_back(alerts::MetricObservation {
+                metric: alerts::MetricType::AssetDrift,
+                asset: Some(asset),
+                value: drift,
+            });
+        }
+        // Assets held but absent from the target (target weight is 0).
+        for (asset, current_weight) in current.allocations.iter() {
+            if !target.allocations.contains_key(asset.clone()) {
+                let drift = current_weight as i128;
+                if drift > max_drift {
+                    max_drift = drift;
+                }
+                observations.push_back(alerts::MetricObservation {
+                    metric: alerts::MetricType::AssetDrift,
+                    asset: Some(asset),
+                    value: drift,
+                });
+            }
+        }
+
+        observations.push_back(alerts::MetricObservation {
+            metric: alerts::MetricType::PortfolioDrift,
+            asset: None,
+            value: max_drift,
+        });
+
+        observations
     }
 
     fn calculate_rebalance(
@@ -1369,6 +1637,9 @@ impl RebalancingContract {
 
 #[cfg(test)]
 mod tests_rbac;
+
+#[cfg(test)]
+mod tests_alerts;
 
 #[cfg(test)]
 mod tests {
