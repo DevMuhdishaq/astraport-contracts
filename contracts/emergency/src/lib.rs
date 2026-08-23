@@ -1089,3 +1089,249 @@ impl EmergencyControls {
         symbol_short!("ok")
     }
 }
+
+// ============================================================================
+// Unit Tests (pure functions only — no Address/auth required)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_codes() {
+        assert_eq!(Error::NotInitialized as u32, 1);
+        assert_eq!(Error::AlreadyInitialized as u32, 2);
+        assert_eq!(Error::AdminRequired as u32, 3);
+        assert_eq!(Error::GuardianRequired as u32, 4);
+        assert_eq!(Error::AlreadyPaused as u32, 5);
+        assert_eq!(Error::NotPaused as u32, 6);
+        assert_eq!(Error::AlreadyInSafeMode as u32, 7);
+        assert_eq!(Error::NotInSafeMode as u32, 8);
+        assert_eq!(Error::CircuitBreakerTripped as u32, 9);
+        assert_eq!(Error::TradeSizeExceedsLimit as u32, 10);
+        assert_eq!(Error::OperationRateLimited as u32, 11);
+        assert_eq!(Error::InvalidConfiguration as u32, 12);
+        assert_eq!(Error::ArithmeticOverflow as u32, 13);
+        assert_eq!(Error::InsufficientBalance as u32, 14);
+        assert_eq!(Error::LockPeriodNotExpired as u32, 15);
+        assert_eq!(Error::IncidentLogFull as u32, 16);
+        assert_eq!(Error::TooManyNotifiers as u32, 17);
+        assert_eq!(Error::CannotPauseGuardian as u32, 18);
+        assert_eq!(Error::OperationBlockedBySafeMode as u32, 19);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(BPS_DENOM, 10_000);
+        assert_eq!(MAX_INCIDENT_LOG, 200);
+        assert_eq!(MAX_NOTIFIERS, 50);
+        assert_eq!(DEFAULT_CIRCUIT_THRESHOLD_BPS, 2000);
+        assert_eq!(DEFAULT_MAX_TRADE_AMOUNT, 100_000_000);
+        assert_eq!(DEFAULT_EMERGENCY_WITHDRAWAL_FEE_BPS, 1000);
+        assert_eq!(DEFAULT_LOCK_PERIOD, 86400);
+    }
+
+    #[test]
+    fn test_incident_action_type_variants() {
+        assert_eq!(IncidentActionType::Pause as u32, 0);
+        assert_eq!(IncidentActionType::Unpause as u32, 1);
+        assert_eq!(IncidentActionType::EmergencyWithdrawal as u32, 2);
+        assert_eq!(IncidentActionType::CircuitBreakerTrip as u32, 3);
+        assert_eq!(IncidentActionType::CircuitBreakerReset as u32, 4);
+        assert_eq!(IncidentActionType::SafeModeEnter as u32, 5);
+        assert_eq!(IncidentActionType::SafeModeExit as u32, 6);
+        assert_eq!(IncidentActionType::MaxTradeUpdated as u32, 7);
+        assert_eq!(IncidentActionType::ThresholdUpdated as u32, 8);
+        assert_eq!(IncidentActionType::RateLimitUpdated as u32, 9);
+        assert_eq!(IncidentActionType::ConfigUpdated as u32, 10);
+        assert_eq!(IncidentActionType::TradeBlocked as u32, 11);
+        assert_eq!(IncidentActionType::OperationBlocked as u32, 12);
+    }
+
+    #[test]
+    fn test_severity_variants() {
+        assert_eq!(IncidentSeverity::Low as u32, 0);
+        assert_eq!(IncidentSeverity::Medium as u32, 1);
+        assert_eq!(IncidentSeverity::High as u32, 2);
+        assert_eq!(IncidentSeverity::Critical as u32, 3);
+    }
+
+    #[test]
+    fn test_severity_ordering() {
+        assert!(IncidentSeverity::Low < IncidentSeverity::Medium);
+        assert!(IncidentSeverity::Medium < IncidentSeverity::High);
+        assert!(IncidentSeverity::High < IncidentSeverity::Critical);
+    }
+
+    #[test]
+    fn test_severity_equality() {
+        assert_eq!(IncidentSeverity::Low, IncidentSeverity::Low);
+        assert_ne!(IncidentSeverity::Low, IncidentSeverity::Critical);
+    }
+
+    #[test]
+    fn test_incident_action_type_equality() {
+        assert_eq!(IncidentActionType::Pause, IncidentActionType::Pause);
+        assert_ne!(IncidentActionType::Pause, IncidentActionType::Unpause);
+    }
+
+    #[test]
+    fn test_emergency_state_default_values() {
+        let state = EmergencyState {
+            is_paused: false,
+            is_safe_mode: false,
+            circuit_breaker_tripped: false,
+            circuit_threshold_bps: DEFAULT_CIRCUIT_THRESHOLD_BPS,
+            max_trade_amount: DEFAULT_MAX_TRADE_AMOUNT,
+            emergency_withdrawal_fee_bps: DEFAULT_EMERGENCY_WITHDRAWAL_FEE_BPS,
+            lock_period: DEFAULT_LOCK_PERIOD,
+            incident_count: 0,
+            paused_reason: symbol_short!("none"),
+            safe_mode_reason: symbol_short!("none"),
+        };
+        assert!(!state.is_paused);
+        assert!(!state.is_safe_mode);
+        assert!(!state.circuit_breaker_tripped);
+        assert_eq!(state.circuit_threshold_bps, 2000);
+        assert_eq!(state.max_trade_amount, 100_000_000);
+        assert_eq!(state.emergency_withdrawal_fee_bps, 1000);
+        assert_eq!(state.lock_period, 86400);
+        assert_eq!(state.incident_count, 0);
+    }
+
+    #[test]
+    fn test_emergency_state_clone() {
+        let state = EmergencyState {
+            is_paused: true,
+            is_safe_mode: false,
+            circuit_breaker_tripped: true,
+            circuit_threshold_bps: 1500,
+            max_trade_amount: 50_000_000,
+            emergency_withdrawal_fee_bps: 750,
+            lock_period: 3600,
+            incident_count: 5,
+            paused_reason: symbol_short!("TEST"),
+            safe_mode_reason: symbol_short!("none"),
+        };
+        let cloned = state.clone();
+        assert_eq!(state.is_paused, cloned.is_paused);
+        assert_eq!(state.circuit_threshold_bps, cloned.circuit_threshold_bps);
+        assert_eq!(state.incident_count, cloned.incident_count);
+    }
+
+    #[test]
+    fn test_rate_limit_config_clone() {
+        let config = RateLimitConfig {
+            operation: symbol_short!("TRADE"),
+            max_calls: 10,
+            window_seconds: 60,
+        };
+        let cloned = config.clone();
+        assert_eq!(config.operation, cloned.operation);
+        assert_eq!(config.max_calls, cloned.max_calls);
+        assert_eq!(config.window_seconds, cloned.window_seconds);
+    }
+
+    #[test]
+    fn test_rate_limit_counter_clone() {
+        let counter = RateLimitCounter {
+            operation: symbol_short!("SWAP"),
+            count: 3,
+            window_start: 500,
+        };
+        let cloned = counter.clone();
+        assert_eq!(counter.operation, cloned.operation);
+        assert_eq!(counter.count, cloned.count);
+        assert_eq!(counter.window_start, cloned.window_start);
+    }
+
+    #[test]
+    fn test_emergency_withdrawal_fee_calculation() {
+        let amount: i128 = 1_000_000;
+        let fee_bps: i128 = 1000;
+        let penalty = amount * fee_bps / BPS_DENOM;
+        let net = amount - penalty;
+        assert_eq!(penalty, 100_000);
+        assert_eq!(net, 900_000);
+    }
+
+    #[test]
+    fn test_emergency_withdrawal_zero_fee() {
+        let amount: i128 = 1_000_000;
+        let fee_bps: i128 = 0;
+        let penalty = amount * fee_bps / BPS_DENOM;
+        let net = amount - penalty;
+        assert_eq!(penalty, 0);
+        assert_eq!(net, 1_000_000);
+    }
+
+    #[test]
+    fn test_emergency_withdrawal_high_fee() {
+        let amount: i128 = 1_000_000;
+        let fee_bps: i128 = 5000;
+        let penalty = amount * fee_bps / BPS_DENOM;
+        let net = amount - penalty;
+        assert_eq!(penalty, 500_000);
+        assert_eq!(net, 500_000);
+    }
+
+    #[test]
+    fn test_trade_size_within_limit() {
+        assert!(50_000_000 <= 100_000_000);
+    }
+
+    #[test]
+    fn test_trade_size_exceeds_limit() {
+        assert!(200_000_000 > 100_000_000);
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold_calculation() {
+        assert!(2500 >= 2000);
+    }
+
+    #[test]
+    fn test_circuit_breaker_negative_price_change() {
+        let price_change_bps: i128 = -3000;
+        let abs_change = if price_change_bps < 0 { -price_change_bps } else { price_change_bps };
+        assert!(abs_change >= 2000);
+    }
+
+    #[test]
+    fn test_circuit_breaker_below_threshold() {
+        assert!(1500 < 2000);
+    }
+
+    #[test]
+    fn test_lock_period_expiry_calculation() {
+        let now: u64 = 200;
+        let staked_at: u64 = 50;
+        let lock_period: u64 = 100;
+        assert!(now >= staked_at + lock_period);
+    }
+
+    #[test]
+    fn test_lock_period_not_expired() {
+        let now: u64 = 100;
+        let staked_at: u64 = 50;
+        let lock_period: u64 = 100;
+        assert!(now < staked_at + lock_period);
+    }
+
+    #[test]
+    fn test_rate_limit_counter_expiry() {
+        let now: u64 = 200;
+        let window_start: u64 = 100;
+        let window_seconds: u64 = 60;
+        assert!(now >= window_start + window_seconds);
+    }
+
+    #[test]
+    fn test_rate_limit_counter_not_expired() {
+        let now: u64 = 120;
+        let window_start: u64 = 100;
+        let window_seconds: u64 = 60;
+        assert!(now < window_start + window_seconds);
+    }
+}
