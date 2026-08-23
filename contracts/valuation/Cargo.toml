@@ -1,16 +1,14 @@
 [package]
-name = "astraport-staking"
+name = "astraport-valuation"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-astraport-audit = { path = "../audit" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
