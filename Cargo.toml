@@ -4,6 +4,8 @@ members = [
     "contracts/rebalancing",
     "contracts/events",
     "contracts/staking",
+    "contracts/fee",
+    "contracts/gamification",
     "contracts/pricefeed",
     "contracts/valuation",
     "contracts/versioning",
