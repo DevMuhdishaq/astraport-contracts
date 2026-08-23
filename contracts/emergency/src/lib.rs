@@ -18,12 +18,18 @@ const CIRCUIT_TRIP: Symbol = symbol_short!("CRT_T");
 const CIRCUIT_THRESH: Symbol = symbol_short!("CRT_TH");
 const MAX_TRADE: Symbol = symbol_short!("MX_TR");
 const EMERG_WD_FEE: Symbol = symbol_short!("EM_WF");
+const INCIDENT_LOG: Symbol = symbol_short!("INC_L");
+const RATE_LIMITS: Symbol = symbol_short!("RT_LT");
+const RATE_COUNTERS: Symbol = symbol_short!("RT_CN");
+const NOTIFIERS: Symbol = symbol_short!("NOTF");
 const LOCK_PERIOD: Symbol = symbol_short!("LCK_P");
 
 // ============================================================================
 // Limits & Constants
 // ============================================================================
 
+const MAX_INCIDENT_LOG: u32 = 200;
+const MAX_NOTIFIERS: u32 = 50;
 const DEFAULT_CIRCUIT_THRESHOLD_BPS: i128 = 2000; // 20%
 const DEFAULT_MAX_TRADE_AMOUNT: i128 = 100_000_000; // 100M units
 const DEFAULT_EMERGENCY_WITHDRAWAL_FEE_BPS: i128 = 1000; // 10% penalty
@@ -89,6 +95,36 @@ pub enum IncidentActionType {
     ConfigUpdated = 10,
     TradeBlocked = 11,
     OperationBlocked = 12,
+}
+
+/// A recorded incident in the event log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct IncidentRecord {
+    pub timestamp: u64,
+    pub action_type: IncidentActionType,
+    pub severity: IncidentSeverity,
+    pub initiator: Address,
+    pub description: Symbol,
+    pub data: i128,
+}
+
+/// Rate limit configuration for an operation type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct RateLimitConfig {
+    pub operation: Symbol,
+    pub max_calls: u32,
+    pub window_seconds: u64,
+}
+
+/// Rate limit counter tracking calls in the current window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct RateLimitCounter {
+    pub operation: Symbol,
+    pub count: u32,
+    pub window_start: u64,
 }
 
 /// Snapshot of current emergency system state.
@@ -224,6 +260,79 @@ fn put_lock_period(env: &Env, period: u64) {
     env.storage().instance().set(&LOCK_PERIOD, &period);
 }
 
+fn get_incident_log(env: &Env) -> soroban_sdk::Vec<IncidentRecord> {
+    env.storage()
+        .persistent()
+        .get(&INCIDENT_LOG)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+fn put_incident_log(env: &Env, log: &soroban_sdk::Vec<IncidentRecord>) {
+    env.storage().persistent().set(&INCIDENT_LOG, log);
+}
+
+fn append_incident(
+    env: &Env,
+    action_type: IncidentActionType,
+    severity: IncidentSeverity,
+    initiator: &Address,
+    description: Symbol,
+    data: i128,
+) {
+    let mut log = get_incident_log(env);
+    if log.len() >= MAX_INCIDENT_LOG {
+        log = log.slice(1..);
+    }
+    log.push_back(IncidentRecord {
+        timestamp: env.ledger().timestamp(),
+        action_type,
+        severity,
+        initiator: initiator.clone(),
+        description,
+        data,
+    });
+    put_incident_log(env, &log);
+}
+
+fn get_rate_limits(env: &Env) -> soroban_sdk::Vec<RateLimitConfig> {
+    env.storage()
+        .persistent()
+        .get(&RATE_LIMITS)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+fn put_rate_limits(env: &Env, limits: &soroban_sdk::Vec<RateLimitConfig>) {
+    env.storage().persistent().set(&RATE_LIMITS, limits);
+}
+
+fn get_rate_counter(env: &Env, operation: &Symbol) -> RateLimitCounter {
+    let key = (RATE_COUNTERS, operation);
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(RateLimitCounter {
+            operation: operation.clone(),
+            count: 0,
+            window_start: 0,
+        })
+}
+
+fn put_rate_counter(env: &Env, counter: &RateLimitCounter) {
+    let key = (RATE_COUNTERS, &counter.operation);
+    env.storage().persistent().set(&key, counter);
+}
+
+fn get_notifiers(env: &Env) -> soroban_sdk::Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&NOTIFIERS)
+        .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+}
+
+fn put_notifiers(env: &Env, notifiers: &soroban_sdk::Vec<Address>) {
+    env.storage().persistent().set(&NOTIFIERS, notifiers);
+}
+
 // ============================================================================
 // Authorization Helpers
 // ============================================================================
@@ -291,6 +400,15 @@ impl EmergencyControls {
         put_paused(&env, true);
         put_pause_reason(&env, &reason);
 
+        append_incident(
+            &env,
+            IncidentActionType::Pause,
+            IncidentSeverity::Critical,
+            &caller,
+            reason.clone(),
+            0,
+        );
+
         env.events().publish(
             (symbol_short!("PAUSE"), &caller),
             &reason,
@@ -301,7 +419,7 @@ impl EmergencyControls {
 
     /// Resume operations after a pause. Only admin can unpause.
     pub fn unpause(env: Env, reason: Symbol) -> Symbol {
-        let _admin = require_admin(&env);
+        let admin = require_admin(&env);
 
         if !get_paused(&env) {
             soroban_sdk::panic_with_error!(&env, Error::NotPaused);
@@ -310,8 +428,17 @@ impl EmergencyControls {
         put_paused(&env, false);
         put_pause_reason(&env, &symbol_short!("none"));
 
+        append_incident(
+            &env,
+            IncidentActionType::Unpause,
+            IncidentSeverity::High,
+            &admin,
+            reason.clone(),
+            0,
+        );
+
         env.events().publish(
-            (symbol_short!("UNPAUS"), &_admin),
+            (symbol_short!("UNPAUS"), &admin),
             &reason,
         );
 
@@ -348,6 +475,15 @@ impl EmergencyControls {
             / BPS_DENOM;
         let net_amount = amount - penalty;
 
+        append_incident(
+            &env,
+            IncidentActionType::EmergencyWithdrawal,
+            IncidentSeverity::High,
+            &user,
+            symbol_short!("EM_WD"),
+            amount,
+        );
+
         env.events().publish(
             (symbol_short!("EM_WD"), &user),
             (amount, penalty, net_amount),
@@ -363,7 +499,7 @@ impl EmergencyControls {
 
     /// Set the emergency withdrawal penalty fee (admin only).
     pub fn set_emergency_withdrawal_fee(env: Env, fee_bps: i128) -> Symbol {
-        let _admin = require_admin(&env);
+        let admin = require_admin(&env);
 
         if fee_bps < 0 || fee_bps > BPS_DENOM {
             soroban_sdk::panic_with_error!(&env, Error::InvalidConfiguration);
@@ -371,8 +507,12 @@ impl EmergencyControls {
 
         put_emergency_wd_fee(&env, fee_bps);
 
-        env.events().publish(
-            (symbol_short!("EM_WF"), &_admin),
+        append_incident(
+            &env,
+            IncidentActionType::ConfigUpdated,
+            IncidentSeverity::Medium,
+            &admin,
+            symbol_short!("EM_WF"),
             fee_bps,
         );
 
@@ -400,6 +540,15 @@ impl EmergencyControls {
             put_paused(&env, true);
             put_pause_reason(&env, &symbol_short!("CIRCUIT"));
 
+            append_incident(
+                &env,
+                IncidentActionType::CircuitBreakerTrip,
+                IncidentSeverity::Critical,
+                &caller,
+                symbol_short!("CB_TRIP"),
+                price_change_bps,
+            );
+
             env.events().publish(
                 (symbol_short!("CB_TRIP"), &caller),
                 (price_change_bps, threshold),
@@ -426,6 +575,15 @@ impl EmergencyControls {
 
         put_circuit_tripped(&env, false);
 
+        append_incident(
+            &env,
+            IncidentActionType::CircuitBreakerReset,
+            IncidentSeverity::High,
+            &admin,
+            reason.clone(),
+            0,
+        );
+
         env.events().publish(
             (symbol_short!("CB_RST"), &admin),
             &reason,
@@ -449,8 +607,12 @@ impl EmergencyControls {
 
         put_circuit_threshold(&env, threshold_bps);
 
-        env.events().publish(
-            (symbol_short!("CB_TH"), &admin),
+        append_incident(
+            &env,
+            IncidentActionType::ThresholdUpdated,
+            IncidentSeverity::Medium,
+            &admin,
+            symbol_short!("CB_TH"),
             threshold_bps,
         );
 
@@ -485,6 +647,15 @@ impl EmergencyControls {
 
         put_max_trade(&env, max_amount);
 
+        append_incident(
+            &env,
+            IncidentActionType::MaxTradeUpdated,
+            IncidentSeverity::Medium,
+            &admin,
+            symbol_short!("MX_TR"),
+            max_amount,
+        );
+
         env.events().publish(
             (symbol_short!("MX_TR"), &admin),
             max_amount,
@@ -515,6 +686,15 @@ impl EmergencyControls {
         put_safe_mode(&env, true);
         put_safe_mode_reason(&env, &reason);
 
+        append_incident(
+            &env,
+            IncidentActionType::SafeModeEnter,
+            IncidentSeverity::High,
+            &caller,
+            reason.clone(),
+            0,
+        );
+
         env.events().publish(
             (symbol_short!("SF_MOD"), &caller),
             &reason,
@@ -534,6 +714,15 @@ impl EmergencyControls {
         put_safe_mode(&env, false);
         put_safe_mode_reason(&env, &symbol_short!("none"));
 
+        append_incident(
+            &env,
+            IncidentActionType::SafeModeExit,
+            IncidentSeverity::High,
+            &admin,
+            reason.clone(),
+            0,
+        );
+
         env.events().publish(
             (symbol_short!("SF_EXIT"), &admin),
             &reason,
@@ -552,6 +741,166 @@ impl EmergencyControls {
         get_safe_mode_reason(&env)
     }
 
+    /// Validate that an operation is allowed in the current system state.
+    /// Checks pause, safe mode, and circuit breaker status.
+    pub fn validate_operation(
+        env: Env,
+        _operation: Symbol,
+        allow_during_pause: bool,
+        allow_during_safe_mode: bool,
+    ) -> bool {
+        if get_paused(&env) && !allow_during_pause {
+            append_incident(
+                &env,
+                IncidentActionType::OperationBlocked,
+                IncidentSeverity::Medium,
+                &get_admin(&env),
+                symbol_short!("OP_BLK"),
+                0,
+            );
+            return false;
+        }
+
+        if get_safe_mode(&env) && !allow_during_safe_mode {
+            append_incident(
+                &env,
+                IncidentActionType::OperationBlocked,
+                IncidentSeverity::Medium,
+                &get_admin(&env),
+                symbol_short!("OP_SFBL"),
+                0,
+            );
+            return false;
+        }
+
+        if get_circuit_tripped(&env) && !allow_during_pause {
+            append_incident(
+                &env,
+                IncidentActionType::OperationBlocked,
+                IncidentSeverity::High,
+                &get_admin(&env),
+                symbol_short!("CB_BLCK"),
+                0,
+            );
+            return false;
+        }
+
+        true
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate Limiting
+    // -----------------------------------------------------------------------
+
+    /// Set rate limit configuration for an operation (admin only).
+    pub fn set_rate_limit(
+        env: Env,
+        operation: Symbol,
+        max_calls: u32,
+        window_seconds: u64,
+    ) -> Symbol {
+        let admin = require_admin(&env);
+
+        if max_calls == 0 || window_seconds == 0 {
+            soroban_sdk::panic_with_error!(&env, Error::InvalidConfiguration);
+        }
+
+        let config = RateLimitConfig {
+            operation: operation.clone(),
+            max_calls,
+            window_seconds,
+        };
+
+        let mut limits = get_rate_limits(&env);
+        let mut found = false;
+        let mut idx: u32 = 0;
+        while idx < limits.len() {
+            let existing = limits.get(idx).unwrap();
+            if existing.operation == operation {
+                limits.set(idx, config.clone());
+                found = true;
+                break;
+            }
+            idx += 1;
+        }
+        if !found {
+            limits.push_back(config);
+        }
+        put_rate_limits(&env, &limits);
+
+        append_incident(
+            &env,
+            IncidentActionType::RateLimitUpdated,
+            IncidentSeverity::Low,
+            &admin,
+            symbol_short!("RT_UPD"),
+            max_calls as i128,
+        );
+
+        symbol_short!("ok")
+    }
+
+    /// Check rate limit and increment counter if allowed.
+    /// Returns true if the operation is within rate limits.
+    pub fn check_rate_limit(env: Env, operation: Symbol) -> bool {
+        let limits = get_rate_limits(&env);
+        let now = env.ledger().timestamp();
+
+        let mut config_option: Option<RateLimitConfig> = None;
+        for limit in limits.iter() {
+            if limit.operation == operation {
+                config_option = Some(limit);
+                break;
+            }
+        }
+
+        let config = match config_option {
+            Some(c) => c,
+            None => return true, // No rate limit configured, allow
+        };
+
+        let mut counter = get_rate_counter(&env, &operation);
+
+        if now >= counter.window_start + config.window_seconds {
+            counter.count = 0;
+            counter.window_start = now;
+        }
+
+        if counter.count >= config.max_calls {
+            append_incident(
+                &env,
+                IncidentActionType::OperationBlocked,
+                IncidentSeverity::Medium,
+                &get_admin(&env),
+                symbol_short!("RT_BLCK"),
+                counter.count as i128,
+            );
+            return false;
+        }
+
+        counter.count += 1;
+        put_rate_counter(&env, &counter);
+
+        true
+    }
+
+    /// Get the current rate limit config for an operation.
+    pub fn get_rate_limit_config(env: Env, operation: Symbol) -> Option<RateLimitConfig> {
+        let limits = get_rate_limits(&env);
+        for limit in limits.iter() {
+            if limit.operation == operation {
+                return Some(limit);
+            }
+        }
+        None
+    }
+
+    /// Get the current call count for a rate-limited operation.
+    pub fn get_rate_limit_count(env: Env, operation: Symbol) -> u32 {
+        let counter = get_rate_counter(&env, &operation);
+        counter.count
+    }
+
     // -----------------------------------------------------------------------
     // Guardian Management
     // -----------------------------------------------------------------------
@@ -561,8 +910,12 @@ impl EmergencyControls {
         let admin = require_admin(&env);
         put_guardian(&env, &guardian);
 
-        env.events().publish(
-            (symbol_short!("GRD_SET"), &admin),
+        append_incident(
+            &env,
+            IncidentActionType::ConfigUpdated,
+            IncidentSeverity::Medium,
+            &admin,
+            symbol_short!("GRD_SET"),
             0,
         );
 
@@ -598,6 +951,98 @@ impl EmergencyControls {
     }
 
     // -----------------------------------------------------------------------
+    // Notification System
+    // -----------------------------------------------------------------------
+
+    /// Register a notifier address (admin only).
+    pub fn add_notifier(env: Env, notifier: Address) -> Symbol {
+        let _admin = require_admin(&env);
+
+        let mut notifiers = get_notifiers(&env);
+        if notifiers.len() >= MAX_NOTIFIERS {
+            soroban_sdk::panic_with_error!(&env, Error::TooManyNotifiers);
+        }
+
+        for existing in notifiers.iter() {
+            if existing == notifier {
+                return symbol_short!("ok");
+            }
+        }
+
+        notifiers.push_back(notifier);
+        put_notifiers(&env, &notifiers);
+
+        symbol_short!("ok")
+    }
+
+    /// Remove a notifier address (admin only).
+    pub fn remove_notifier(env: Env, notifier: Address) -> Symbol {
+        let _admin = require_admin(&env);
+        let notifiers = get_notifiers(&env);
+        let mut new_notifiers = soroban_sdk::Vec::new(&env);
+
+        for existing in notifiers.iter() {
+            if existing != notifier {
+                new_notifiers.push_back(existing);
+            }
+        }
+
+        put_notifiers(&env, &new_notifiers);
+        symbol_short!("ok")
+    }
+
+    /// Get all registered notifier addresses.
+    pub fn get_notifiers_list(env: Env) -> soroban_sdk::Vec<Address> {
+        get_notifiers(&env)
+    }
+
+    /// Emit a notification event for all registered notifiers.
+    pub fn notify(
+        env: Env,
+        event_type: Symbol,
+        severity: IncidentSeverity,
+        data: i128,
+    ) -> u32 {
+        let notifiers = get_notifiers(&env);
+        let count = notifiers.len();
+
+        for notifier in notifiers.iter() {
+            env.events().publish(
+                (symbol_short!("NOTIFY"), &notifier),
+                (&event_type, severity as u32, data),
+            );
+        }
+
+        count
+    }
+
+    // -----------------------------------------------------------------------
+    // Incident Log
+    // -----------------------------------------------------------------------
+
+    /// Get all incident records (up to max entries). 0 = all.
+    pub fn get_incident_log(env: Env, max_entries: u32) -> soroban_sdk::Vec<IncidentRecord> {
+        let log = get_incident_log(&env);
+        if max_entries == 0 || log.len() <= max_entries {
+            log
+        } else {
+            log.slice(log.len() - max_entries..)
+        }
+    }
+
+    /// Get the total number of incident records.
+    pub fn get_incident_count(env: Env) -> u32 {
+        get_incident_log(&env).len()
+    }
+
+    /// Clear the incident log (admin only).
+    pub fn clear_incident_log(env: Env) -> Symbol {
+        let _admin = require_admin(&env);
+        put_incident_log(&env, &soroban_sdk::Vec::new(&env));
+        symbol_short!("ok")
+    }
+
+    // -----------------------------------------------------------------------
     // System State
     // -----------------------------------------------------------------------
 
@@ -611,7 +1056,7 @@ impl EmergencyControls {
             max_trade_amount: get_max_trade(&env),
             emergency_withdrawal_fee_bps: get_emergency_wd_fee(&env),
             lock_period: get_lock_period(&env),
-            incident_count: 0,
+            incident_count: get_incident_log(&env).len(),
             paused_reason: get_pause_reason(&env),
             safe_mode_reason: get_safe_mode_reason(&env),
         }
@@ -632,8 +1077,12 @@ impl EmergencyControls {
         admin.require_auth();
         put_admin(&env, &new_admin);
 
-        env.events().publish(
-            (symbol_short!("ADM_TRF"), &admin),
+        append_incident(
+            &env,
+            IncidentActionType::ConfigUpdated,
+            IncidentSeverity::Critical,
+            &admin,
+            symbol_short!("ADM_TRF"),
             0,
         );
 
