@@ -846,3 +846,342 @@ mod gamification_integration_tests {
         assert_eq!(all_badges.len(), badge_count);
     }
 }
+
+// ============================================================================
+// Emergency Controls Integration Tests
+// ============================================================================
+
+#[cfg(test)]
+mod emergency_integration_tests {
+    use astraport_emergency::{
+        EmergencyControls, EmergencyState, IncidentActionType, IncidentSeverity,
+    };
+    use soroban_sdk::{symbol_short, Address, Env};
+
+    fn setup() -> (Env, Address) {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        env.mock_all_auths();
+        EmergencyControls::initialize(env.clone(), admin.clone());
+        (env, admin)
+    }
+
+    /// Full emergency lifecycle: setup, incident, response, recovery.
+    #[test]
+    fn test_full_emergency_lifecycle() {
+        let (env, admin) = setup();
+
+        // 1. Set up guardian and notifiers
+        let guardian = Address::generate(&env);
+        EmergencyControls::set_guardian(env.clone(), guardian.clone());
+
+        let notifier1 = Address::generate(&env);
+        let notifier2 = Address::generate(&env);
+        EmergencyControls::add_notifier(env.clone(), notifier1.clone());
+        EmergencyControls::add_notifier(env.clone(), notifier2.clone());
+        assert_eq!(EmergencyControls::get_notifiers_list(env.clone()).len(), 2);
+
+        // 2. Configure safety parameters
+        EmergencyControls::set_max_trade_size(env.clone(), 50_000_000);
+        EmergencyControls::set_circuit_breaker_threshold(env.clone(), 1500); // 15%
+        EmergencyControls::set_emergency_withdrawal_fee(env.clone(), 750); // 7.5%
+        EmergencyControls::set_lock_period(env.clone(), 3600); // 1 hour
+        EmergencyControls::set_rate_limit(env.clone(), symbol_short!("TRADE"), 5, 60);
+        EmergencyControls::set_rate_limit(env.clone(), symbol_short!("SWAP"), 3, 120);
+
+        // 3. Verify normal operations
+        assert!(EmergencyControls::validate_operation(
+            env.clone(), symbol_short!("TRADE"), false, false,
+        ));
+        assert!(EmergencyControls::check_rate_limit(env.clone(), symbol_short!("TRADE")));
+        assert_eq!(EmergencyControls::validate_trade_size(env.clone(), 25_000_000), 25_000_000);
+
+        // 4. Market crash detected - circuit breaker trips
+        let reporter = Address::generate(&env);
+        let tripped = EmergencyControls::report_price_change(env.clone(), reporter, 2000); // 20% > 15%
+        assert!(tripped);
+        assert!(EmergencyControls::is_circuit_breaker_tripped(env.clone()));
+        assert!(EmergencyControls::is_paused(env.clone()));
+
+        // 5. Trading is blocked, but emergency withdrawal works
+        assert!(!EmergencyControls::validate_operation(
+            env.clone(), symbol_short!("TRADE"), false, false,
+        ));
+        let user = Address::generate(&env);
+        let net = EmergencyControls::emergency_withdrawal(env.clone(), user, 10_000_000);
+        assert_eq!(net, 9_250_000); // 10M - 7.5%
+
+        // 6. Guardian enters safe mode for additional protection
+        EmergencyControls::enter_safe_mode(env.clone(), guardian.clone(), symbol_short!("EXTRA"));
+        assert!(EmergencyControls::is_safe_mode(env.clone()));
+
+        // 7. Notify all watchers
+        let notified = EmergencyControls::notify(
+            env.clone(), symbol_short!("ALERT"), IncidentSeverity::Critical, 2000,
+        );
+        assert_eq!(notified, 2);
+
+        // 8. Admin investigates and resolves
+        EmergencyControls::reset_circuit_breaker(env.clone(), symbol_short!("FIXED"));
+        EmergencyControls::exit_safe_mode(env.clone(), symbol_short!("CLEAR"));
+        EmergencyControls::unpause(env.clone(), symbol_short!("ALL_OK"));
+
+        // 9. Operations resume
+        assert!(EmergencyControls::validate_operation(
+            env.clone(), symbol_short!("TRADE"), false, false,
+        ));
+        assert!(EmergencyControls::check_rate_limit(env.clone(), symbol_short!("TRADE")));
+
+        // 10. Verify incident log captures full timeline
+        let log = EmergencyControls::get_incident_log(env.clone(), 0);
+        assert!(log.len() >= 7);
+
+        // Verify the first incident was the circuit breaker trip
+        let first = log.get(0).unwrap();
+        assert_eq!(first.action_type, IncidentActionType::CircuitBreakerTrip);
+        assert_eq!(first.severity, IncidentSeverity::Critical);
+
+        // Verify emergency state snapshot
+        let state = EmergencyControls::get_emergency_state(env.clone());
+        assert!(!state.is_paused);
+        assert!(!state.is_safe_mode);
+        assert!(!state.circuit_breaker_tripped);
+        assert_eq!(state.circuit_threshold_bps, 1500);
+        assert_eq!(state.max_trade_amount, 50_000_000);
+        assert_eq!(state.emergency_withdrawal_fee_bps, 750);
+        assert_eq!(state.lock_period, 3600);
+    }
+
+    /// Guardian-initiated emergency pause and admin recovery.
+    #[test]
+    fn test_guardian_emergency_response() {
+        let (env, admin) = setup();
+
+        let guardian = Address::generate(&env);
+        EmergencyControls::set_guardian(env.clone(), guardian.clone());
+
+        // Guardian detects anomaly and pauses
+        EmergencyControls::pause(
+            env.clone(), guardian.clone(), symbol_short!("ANOMALY"),
+        );
+        assert!(EmergencyControls::is_paused(env.clone()));
+        assert_eq!(EmergencyControls::get_pause_reason(env.clone()), symbol_short!("ANOMALY"));
+
+        // Guardian enters safe mode
+        EmergencyControls::enter_safe_mode(
+            env.clone(), guardian.clone(), symbol_short!("PROTECT"),
+        );
+        assert!(EmergencyControls::is_safe_mode(env.clone()));
+
+        // Only admin can resume
+        EmergencyControls::unpause(env.clone(), symbol_short!("RESUMED"));
+        EmergencyControls::exit_safe_mode(env.clone(), symbol_short!("ALL_GOOD"));
+
+        assert!(!EmergencyControls::is_paused(env.clone()));
+        assert!(!EmergencyControls::is_safe_mode(env));
+    }
+
+    /// Rate limiting prevents excessive trading.
+    #[test]
+    fn test_rate_limiting_prevents_abuse() {
+        let (env, _) = setup();
+
+        EmergencyControls::set_rate_limit(
+            env.clone(), symbol_short!("TRADE"), 3, 60,
+        );
+        EmergencyControls::set_rate_limit(
+            env.clone(), symbol_short!("SWAP"), 2, 60,
+        );
+
+        // Exhaust trade limit
+        for _ in 0..3 {
+            assert!(EmergencyControls::check_rate_limit(
+                env.clone(), symbol_short!("TRADE"),
+            ));
+        }
+        assert!(!EmergencyControls::check_rate_limit(
+            env.clone(), symbol_short!("TRADE"),
+        ));
+
+        // Swap still has capacity
+        assert!(EmergencyControls::check_rate_limit(
+            env.clone(), symbol_short!("SWAP"),
+        ));
+        assert!(EmergencyControls::check_rate_limit(
+            env.clone(), symbol_short!("SWAP"),
+        ));
+        assert!(!EmergencyControls::check_rate_limit(
+            env.clone(), symbol_short!("SWAP"),
+        ));
+
+        // Verify counts
+        assert_eq!(EmergencyControls::get_rate_limit_count(
+            env.clone(), symbol_short!("TRADE"),
+        ), 3);
+        assert_eq!(EmergencyControls::get_rate_limit_count(
+            env, symbol_short!("SWAP"),
+        ), 2);
+    }
+
+    /// Multi-user emergency withdrawals with varying penalty tiers.
+    #[test]
+    fn test_emergency_withdrawal_penalties() {
+        let (env, _admin) = setup();
+
+        // Default 10% penalty
+        let user1 = Address::generate(&env);
+        let net1 = EmergencyControls::emergency_withdrawal(env.clone(), user1, 1_000_000);
+        assert_eq!(net1, 900_000);
+
+        // Change to 25% penalty
+        EmergencyControls::set_emergency_withdrawal_fee(env.clone(), 2500);
+        let user2 = Address::generate(&env);
+        let net2 = EmergencyControls::emergency_withdrawal(env.clone(), user2, 1_000_000);
+        assert_eq!(net2, 750_000);
+
+        // Zero penalty for VIP
+        EmergencyControls::set_emergency_withdrawal_fee(env.clone(), 0);
+        let user3 = Address::generate(&env);
+        let net3 = EmergencyControls::emergency_withdrawal(env, user3, 1_000_000);
+        assert_eq!(net3, 1_000_000);
+    }
+
+    /// Circuit breaker with various price change scenarios.
+    #[test]
+    fn test_circuit_breaker_scenarios() {
+        let (env, _) = setup();
+
+        // Set tight threshold: 5%
+        EmergencyControls::set_circuit_breaker_threshold(env.clone(), 500);
+
+        let reporter = Address::generate(&env);
+
+        // 3% change - no trip
+        assert!(!EmergencyControls::report_price_change(
+            env.clone(), reporter.clone(), 300,
+        ));
+        assert!(!EmergencyControls::is_circuit_breaker_tripped(env.clone()));
+
+        // 5% exact - trips
+        assert!(EmergencyControls::report_price_change(
+            env.clone(), reporter.clone(), 500,
+        ));
+        assert!(EmergencyControls::is_circuit_breaker_tripped(env.clone()));
+        assert!(EmergencyControls::is_paused(env.clone()));
+
+        // Reset and try negative
+        EmergencyControls::reset_circuit_breaker(env.clone(), symbol_short!("RST"));
+        EmergencyControls::unpause(env.clone(), symbol_short!("UP"));
+
+        // -7% change - trips
+        assert!(EmergencyControls::report_price_change(
+            env.clone(), reporter, -700,
+        ));
+        assert!(EmergencyControls::is_circuit_breaker_tripped(env));
+    }
+
+    /// Lock period enforcement and expiration.
+    #[test]
+    fn test_lock_period_enforcement() {
+        let (env, _) = setup();
+
+        EmergencyControls::set_lock_period(env.clone(), 100);
+
+        // Not expired at time 50
+        assert!(!EmergencyControls::is_lock_expired(env.clone(), 0));
+
+        // Set ledger past lock period
+        env.ledger().set(150);
+        assert!(EmergencyControls::is_lock_expired(env.clone(), 0));
+
+        // Different stake time
+        env.ledger().set(100);
+        assert!(!EmergencyControls::is_lock_expired(env.clone(), 50));
+        env.ledger().set(160);
+        assert!(EmergencyControls::is_lock_expired(env, 50));
+    }
+
+    /// Admin transfer with full audit trail.
+    #[test]
+    fn test_admin_transfer_with_audit() {
+        let (env, admin) = setup();
+
+        let new_admin = Address::generate(&env);
+        EmergencyControls::transfer_admin(env.clone(), new_admin.clone());
+        assert_eq!(EmergencyControls::get_admin(env.clone()), new_admin);
+
+        // Verify admin transfer was logged
+        let log = EmergencyControls::get_incident_log(env, 0);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.get(0).unwrap().action_type, IncidentActionType::ConfigUpdated);
+    }
+
+    /// Incident log pagination and trimming.
+    #[test]
+    fn test_incident_log_management() {
+        let (env, admin) = setup();
+
+        // Generate multiple incidents
+        for i in 0..10u32 {
+            if i % 2 == 0 {
+                EmergencyControls::pause(env.clone(), admin.clone(), symbol_short!("P"));
+            } else {
+                EmergencyControls::unpause(env.clone(), symbol_short!("U"));
+            }
+        }
+        assert_eq!(EmergencyControls::get_incident_count(env.clone()), 10);
+
+        // Pagination: last 5
+        let recent = EmergencyControls::get_incident_log(env.clone(), 5);
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent.get(0).unwrap().action_type, IncidentActionType::Unpause);
+
+        // All entries
+        let all = EmergencyControls::get_incident_log(env.clone(), 0);
+        assert_eq!(all.len(), 10);
+
+        // Clear
+        EmergencyControls::clear_incident_log(env.clone());
+        assert_eq!(EmergencyControls::get_incident_count(env), 0);
+    }
+
+    /// Notification system delivers to all subscribers.
+    #[test]
+    fn test_notification_delivery() {
+        let (env, _) = setup();
+
+        let mut notifiers = Vec::new();
+        for _ in 0..5 {
+            let n = Address::generate(&env);
+            EmergencyControls::add_notifier(env.clone(), n.clone());
+            notifiers.push(n);
+        }
+
+        // Remove one
+        EmergencyControls::remove_notifier(env.clone(), notifiers[2].clone());
+        assert_eq!(EmergencyControls::get_notifiers_list(env.clone()).len(), 4);
+
+        // Notify - should reach 4
+        let count = EmergencyControls::notify(
+            env.clone(), symbol_short!("UPDATE"), IncidentSeverity::Low, 100,
+        );
+        assert_eq!(count, 4);
+    }
+
+    /// Trade size enforcement across different limits.
+    #[test]
+    fn test_trade_size_enforcement() {
+        let (env, _) = setup();
+
+        // Default limit
+        assert_eq!(EmergencyControls::validate_trade_size(env.clone(), 100_000_000), 100_000_000);
+
+        // Reduced limit
+        EmergencyControls::set_max_trade_size(env.clone(), 10_000_000);
+        assert_eq!(EmergencyControls::validate_trade_size(env.clone(), 10_000_000), 10_000_000);
+
+        // Increased limit
+        EmergencyControls::set_max_trade_size(env.clone(), 500_000_000);
+        assert_eq!(EmergencyControls::validate_trade_size(env, 500_000_000), 500_000_000);
+    }
+}

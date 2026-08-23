@@ -107,6 +107,27 @@ Every permission check is recorded in an append-only access log per portfolio, i
   - Balance monitoring
   - Alert configurations
 
+#### 4. Emergency Controls Contract
+- **Purpose**: Safety mechanisms and emergency response systems
+- **Key Functions**:
+  - `pause()` / `unpause()` - Pause/resume contract operations (admin + guardian)
+  - `emergency_withdrawal()` - Bypass lock periods with penalty fee
+  - `report_price_change()` - Trigger circuit breaker on extreme price moves
+  - `reset_circuit_breaker()` - Reset circuit breaker (admin only)
+  - `enter_safe_mode()` / `exit_safe_mode()` - Reduce functionality during risk
+  - `validate_trade_size()` - Enforce maximum trade size limits
+  - `validate_operation()` - Check if operation is allowed in current state
+  - `set_rate_limit()` / `check_rate_limit()` - Rate limiting on critical operations
+  - `notify()` - Emit notifications to registered watchers
+  - `get_incident_log()` - Query incident history
+  - `get_emergency_state()` - Comprehensive system state snapshot
+- **Use Cases**:
+  - Circuit breakers on market crashes (auto-halt at >20% price change)
+  - Emergency withdrawals bypassing normal lock periods (with configurable penalty)
+  - Pause mechanism preventing new transactions while allowing withdrawals
+  - Safe mode disabling automated operations during risk events
+  - Rate limiting to prevent abuse of critical functions
+  - Full incident audit trail for all emergency actions
 ##### Yield Engine Design
 
 The yield engine is split into focused, independently testable modules:
@@ -157,6 +178,7 @@ Contracts are deployed individually to the Stellar blockchain via the Soroban CL
 soroban contract build --package astraport-rebalancing
 soroban contract build --package astraport-events
 soroban contract build --package astraport-staking
+soroban contract build --package astraport-emergency
 ```
 
 ## Security Considerations
