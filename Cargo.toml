@@ -6,6 +6,7 @@ members = [
     "contracts/staking",
     "contracts/fee",
     "contracts/gamification",
+    "contracts/pricefeed",
     "contracts/valuation",
     "contracts/versioning",
 ]
