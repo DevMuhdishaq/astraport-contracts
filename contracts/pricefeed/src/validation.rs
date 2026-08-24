@@ -5,8 +5,8 @@ use soroban_sdk::{symbol_short, Env, Symbol, Vec};
 
 use crate::records::{
     AggregatedPrice, PriceDataPoint, PriceFeedDataKey, PriceFeedError, PriceStatus,
-    PriceValidationConfig, DEFAULT_MAX_DEVIATION_BPS, DEFAULT_CACHE_TTL_SECONDS,
-    MAX_PRICE_HISTORY, PRICE_PRECISION,
+    PriceValidationConfig, DEFAULT_CACHE_TTL_SECONDS, DEFAULT_MAX_DEVIATION_BPS, MAX_PRICE_HISTORY,
+    PRICE_PRECISION,
 };
 
 // ---------------------------------------------------------------------------
@@ -233,7 +233,11 @@ pub fn resolve_price(env: &Env, asset: Symbol) -> Result<AggregatedPrice, PriceF
     }
 
     // Try to get fresh data from oracles
-    let data_points = crate::oracle::OracleManager::fetch_all_for_asset(env, asset.clone(), env.ledger().timestamp());
+    let data_points = crate::oracle::OracleManager::fetch_all_for_asset(
+        env,
+        asset.clone(),
+        env.ledger().timestamp(),
+    );
     let valid = validate_prices(env, &data_points);
     let non_anomalous: soroban_sdk::Vec<PriceDataPoint> = {
         let mut v = soroban_sdk::Vec::new(env);
@@ -297,7 +301,10 @@ pub fn record_price_history(env: &Env, asset: Symbol, price: i128, num_sources: 
 }
 
 /// Get the price history for an asset.
-pub fn get_price_history(env: &Env, asset: Symbol) -> soroban_sdk::Vec<crate::records::PriceHistoryEntry> {
+pub fn get_price_history(
+    env: &Env,
+    asset: Symbol,
+) -> soroban_sdk::Vec<crate::records::PriceHistoryEntry> {
     let key = PriceFeedDataKey::PriceHistory(asset);
     env.storage()
         .persistent()

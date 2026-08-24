@@ -223,5 +223,3 @@ impl AggregateEngine {
         worst
     }
 }
-
-

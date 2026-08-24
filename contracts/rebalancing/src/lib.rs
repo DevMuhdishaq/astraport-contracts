@@ -8,10 +8,10 @@ use astraport_audit::logger::AuditLogger;
 use astraport_audit::records::{permissions, AuditEventType, StateSnapshot};
 
 pub mod alerts;
-pub mod rbac;
-pub mod records;
 pub mod drift_engine;
 pub mod multi_asset_rebalancer;
+pub mod rbac;
+pub mod records;
 use crate::rbac::{
     assign_role, check_permission, check_permission_detailed, describe_permissions,
     extend_role_expiry, get_access_log, get_raw_assignment, get_role_assignment, has_permission,
@@ -713,11 +713,7 @@ impl RebalancingContract {
         let rebalancer_id =
             env.register_contract(None, multi_asset_rebalancer::MultiAssetRebalancer);
         let client = multi_asset_rebalancer::MultiAssetRebalancerClient::new(&env, &rebalancer_id);
-        Ok(client.simulate_rebalance(
-            &portfolio_id,
-            &strategy,
-            &result.adjustments,
-        ))
+        Ok(client.simulate_rebalance(&portfolio_id, &strategy, &result.adjustments))
     }
 
     // -------------------------------------------------------------------
@@ -1480,12 +1476,7 @@ impl RebalancingContract {
         current: CurrentHoldings,
         threshold_bps: u32,
     ) -> records::RebalanceValidation {
-        drift_engine::DriftEngine::validate_rebalance_inputs(
-            &env,
-            &target,
-            &current,
-            threshold_bps,
-        )
+        drift_engine::DriftEngine::validate_rebalance_inputs(&env, &target, &current, threshold_bps)
     }
 
     /// Execute an atomic rebalance using the core engine.
@@ -1576,10 +1567,9 @@ impl RebalancingContract {
         );
 
         if atomic_success {
-            env.storage().persistent().set(
-                &DataKey::CurrentHoldings(portfolio_id.clone()),
-                &target,
-            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::CurrentHoldings(portfolio_id.clone()), &target);
         }
 
         // Audit logging.
