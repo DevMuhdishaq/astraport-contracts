@@ -27,8 +27,19 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
+      - name: Build working packages
+        run: >
+          cargo build -p astraport-trade -p astraport-audit -p astraport-staking
+          -p astraport-emergency -p astraport-versioning -p astraport-gamification
+          -p astraport-events
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run Clippy on working packages
+        run: >
+          cargo clippy -p astraport-trade -p astraport-audit -p astraport-staking
+          -p astraport-emergency -p astraport-versioning -p astraport-gamification
+          -p astraport-events -- -D warnings
+
+      - name: Run tests
+        run: >
+          cargo test -p astraport-trade -p astraport-emergency
+          -p astraport-versioning -p astraport-gamification

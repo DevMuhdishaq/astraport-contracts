@@ -1,12 +1,11 @@
 //! Price validation logic: staleness detection, anomaly detection, and
 //! fallback mechanisms.
 
-use soroban_sdk::{symbol_short, Env, Symbol, Vec};
+use soroban_sdk::{Env, Symbol, Vec};
 
 use crate::records::{
     AggregatedPrice, PriceDataPoint, PriceFeedDataKey, PriceFeedError, PriceStatus,
     PriceValidationConfig, DEFAULT_CACHE_TTL_SECONDS, DEFAULT_MAX_DEVIATION_BPS, MAX_PRICE_HISTORY,
-    PRICE_PRECISION,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,7 +78,7 @@ pub fn calculate_median(prices: &Vec<PriceDataPoint>) -> Option<i128> {
         return None;
     }
 
-    let len = prices.len() as usize;
+    let _len = prices.len() as usize;
     let mut sorted: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(prices.env());
     for dp in prices.iter() {
         sorted.push_back(dp.price);

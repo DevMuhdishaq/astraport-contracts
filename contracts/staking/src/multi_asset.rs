@@ -17,7 +17,7 @@
 use soroban_sdk::{Address, Env, Symbol, Vec};
 
 use crate::engine::YieldEngine;
-use crate::fixed_point::{self as fp, SCALE};
+use crate::fixed_point as fp;
 use crate::records::{
     AssetYieldRate, GraduatedUnlock, PortfolioSnapshot, StakeDataKey, StakingPosition,
     UnlockSchedule,
@@ -201,7 +201,7 @@ impl<'a> MultiAssetStaking<'a> {
     pub fn portfolio_snapshot(&self, staker: &Address) -> PortfolioSnapshot {
         let assets = self.staker_assets(staker);
         let engine = YieldEngine::new(self.env);
-        let now = self.env.ledger().timestamp();
+        let _now = self.env.ledger().timestamp();
 
         let mut total_principal: i128 = 0;
         let mut total_yield: i128 = 0;

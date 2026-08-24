@@ -163,7 +163,7 @@ impl PenaltyCalculator {
         }
         // If elapsed >= total, the lock has matured — apply end penalty.
         if elapsed_seconds >= total_lock_seconds {
-            return Ok(config.penalty_end_bps.max(0).min(MAX_BPS));
+            return Ok(config.penalty_end_bps.clamp(0, MAX_BPS));
         }
 
         let start = config.penalty_start_bps;
@@ -182,7 +182,7 @@ impl PenaltyCalculator {
             }
         };
 
-        Ok(bps.max(0).min(MAX_BPS))
+        Ok(bps.clamp(0, MAX_BPS))
     }
 
     /// Linear interpolation between `start` and `end`.

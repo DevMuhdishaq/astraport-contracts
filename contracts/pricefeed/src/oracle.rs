@@ -1,9 +1,9 @@
 //! Oracle provider management and price fetching logic.
 
-use soroban_sdk::{contractimpl, contracttype, symbol_short, Address, Env, Map, Symbol, Vec};
+use soroban_sdk::{symbol_short, Env, Map, Symbol, Vec};
 
 use crate::records::{
-    OracleProvider, PriceDataPoint, PriceFeedDataKey, PriceFeedError, PriceStatus, PRICE_PRECISION,
+    OracleProvider, PriceDataPoint, PriceFeedDataKey, PriceFeedError, PriceStatus,
 };
 
 // ---------------------------------------------------------------------------

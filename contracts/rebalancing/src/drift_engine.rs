@@ -332,7 +332,7 @@ impl DriftEngine {
             asset_count += 1;
         }
         if target_total != 10_000 {
-            issues.push_back(symbol_short!("bad_target"));
+            issues.push_back(symbol_short!("bad_tgt"));
         }
 
         // Check current holdings sum.
@@ -343,12 +343,12 @@ impl DriftEngine {
             current_asset_count += 1;
         }
         if current_total != 10_000 {
-            issues.push_back(symbol_short!("bad_current"));
+            issues.push_back(symbol_short!("bad_cur"));
         }
 
         // Check threshold.
         if threshold_bps > 10_000 {
-            issues.push_back(symbol_short!("bad_thresh"));
+            issues.push_back(symbol_short!("bad_thr"));
         }
 
         // Check asset count bounds.

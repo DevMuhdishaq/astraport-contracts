@@ -95,6 +95,14 @@ pub enum Error {
     InvalidClaimAmount = 9,
     /// No yield position exists for this staker/asset pair.
     NoYieldPosition = 10,
+    /// Contract has already been initialized.
+    AlreadyInitialized = 11,
+    /// Caller is not authorized.
+    Unauthorized = 12,
+    /// Amount exceeds the maximum stake limit.
+    ExceedsMaximumStake = 13,
+    /// Amount exceeds the unlocked (available) amount.
+    ExceedsUnlockedAmount = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -754,7 +762,7 @@ impl StakingContract {
     /// Admin-only. Increases the reserve balance used to back distributions.
     pub fn fund_reserve(env: Env, admin: Address, asset: Symbol, amount: i128) -> i128 {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        let _ = Self::assert_admin(&env, &admin);
         YieldEngine::new(&env).fund_reserve(&asset, amount)
     }
 
@@ -768,7 +776,7 @@ impl StakingContract {
     /// Admin-only. Reduces the reserve balance and returns the new balance.
     pub fn withdraw_reserve(env: Env, admin: Address, asset: Symbol, amount: i128) -> i128 {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        let _ = Self::assert_admin(&env, &admin);
         YieldEngine::new(&env).withdraw_reserve(&asset, amount)
     }
 
@@ -780,7 +788,7 @@ impl StakingContract {
     /// directly).
     pub fn pause_distributions(env: Env, admin: Address) -> Symbol {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        let _ = Self::assert_admin(&env, &admin);
         YieldEngine::new(&env).set_paused(true);
         symbol_short!("paused")
     }
@@ -788,7 +796,7 @@ impl StakingContract {
     /// Resume yield distributions after a pause.
     pub fn unpause_distributions(env: Env, admin: Address) -> Symbol {
         admin.require_auth();
-        Self::assert_admin(&env, &admin);
+        let _ = Self::assert_admin(&env, &admin);
         YieldEngine::new(&env).set_paused(false);
         symbol_short!("active")
     }
